@@ -66,16 +66,46 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 
 Скиллы синкаются в `hermes-data/skills/` перед спавном. Формат переносимый ([agentskills.io](https://agentskills.io)) — те же скиллы работают в Claude Code, Cursor, OpenCode.
 
+## MCP (FastMCP 3.4.2)
+
+Три инструмента (`searcharvester_search`, `searcharvester_extract`, `searcharvester_research`) смонтированы на `/mcp/` внутри того же FastAPI-приложения на порту 8000.
+
+**Критичные детали wiring в `main.py`:**
+- `mcp.http_app(path="/")` — `path="/"` обязателен: без него sub-app маршрут `/mcp` внутри, и при монтировании получается `/mcp/mcp`.
+- `app = FastAPI(..., lifespan=_mcp_app.lifespan)` — lifespan обязательно пробрасывать; без него краш при старте.
+- DNS rebinding защита: `TrustedHostMiddleware` передаётся через `mcp.http_app(middleware=[...])` (не на уровне FastAPI app). Настраивается через `MCP_ALLOWED_HOSTS` (по умолчанию `localhost` + `127.0.0.1`).
+
+**Регистрация в Claude Code:**
+```bash
+claude mcp add --transport http searcharvester http://localhost:8000/mcp/
+```
+
+**MCP smoke test:**
+```bash
+SESSION=$(curl -si -X POST http://localhost:8000/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' \
+  | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
+
+curl -s -X POST http://localhost:8000/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SESSION" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{}}' | python3 -m json.tool
+```
+
 ## Тесты
 
 - `tests/test_events.py` — 5 unit-тестов нормализатора ACP → Event. Не требуют Docker/hermes.
 - `tests/test_research_api.py` — 7 FastAPI route-тестов с моком оркестратора (AsyncMock).
+- `tests/test_mcp_tools.py` — 9 тестов MCP tool handlers (search/extract/research) с моками.
 - `tests/test_e2e.py` — gated `RUN_E2E=1`. Реальный Hermes + vLLM end-to-end.
 
 Старые `test_orchestrator.py` (FakeDockerClient) удалены — оркестратор больше не использует docker-py. Реальное покрытие "ACP subprocess → events" сейчас даёт E2E (или Playwright smoke через UI).
 
 ```bash
-docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 12 passed за ~2с
+docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 21 passed за ~2с
 # (pytest не в PATH как алиас — идёт через venv-python)
 ```
 

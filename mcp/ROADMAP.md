@@ -21,11 +21,14 @@ Direct passthrough of the `engines` field to SearXNG (e.g. `"google,brave,duckdu
 
 ## Phase 3 — Hardening
 
-- **Origin header validation** on `POST /mcp` — required by the MCP spec to prevent DNS rebinding attacks
+- ~~**Origin header validation** on `POST /mcp`~~ — done (`TrustedHostMiddleware`)
+- ~~**Structured logging**~~ — done (entry/exit log lines on all three MCP tools)
 - **`MCP-Protocol-Version` enforcement** — return 400 for unsupported protocol versions
 - **Per-tool timeouts** — search (30s), extract (30s), and research (configurable, default 15 min) each have different SLAs; make them independently configurable via env vars
-- **Startup health check** — fail fast with a clear error if `SEARCHARVESTER_URL` is unreachable at server start
-- **Structured logging** — log tool calls with duration, URLs, and error codes; correlate research calls with their `job_id`
+- **Startup health check** — fail fast with a clear error if the upstream is unreachable at server start
+- **Retry logic** — search and extract fail immediately on transient upstream errors (SearXNG 504, connection reset); one retry with short backoff would recover most cases
+- **`aiohttp.ClientSession` pooling** — `_extract_markdown_for_url` opens a new session per URL; replace with a module-level singleton to avoid a new TCP connection per call under concurrent load
+- **`stdio` transport** — Claude Desktop prefers stdio for local MCP servers; add `MCP_TRANSPORT` env var: when set to `stdio`, call `mcp.run(transport="stdio")` instead of HTTP
 
 ## Phase 4 — Docker integration
 

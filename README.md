@@ -329,6 +329,28 @@ Published to GitHub Container Registry — public:
 
 `docker-compose.yaml` uses `image:` by default — no build needed. For local dev: `docker compose up --build`.
 
+## MCP
+
+The adapter exposes three tools via the Model Context Protocol at `http://localhost:8000/mcp/`:
+
+| Tool | What it does |
+|---|---|
+| `searcharvester_search` | Web search via SearXNG — returns ranked results with titles, URLs, and snippets |
+| `searcharvester_extract` | Fetches one or more URLs and returns clean markdown (navigation and ads stripped) |
+| `searcharvester_research` | Deep multi-source research — searches, extracts, synthesises a cited markdown report (takes minutes) |
+
+**Register with Claude Code:**
+```bash
+claude mcp add --transport http searcharvester http://localhost:8000/mcp/
+```
+
+**DNS rebinding protection** is enabled by default — only requests with a `Host` header matching `localhost` or `127.0.0.1` are accepted. Set `MCP_ALLOWED_HOSTS` to override (comma-separated, supports `host:*` wildcards):
+```bash
+MCP_ALLOWED_HOSTS=myserver.internal,myserver.internal:* docker compose up -d
+```
+
+---
+
 ## 🔧 Development
 
 ```bash
