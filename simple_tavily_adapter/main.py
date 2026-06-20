@@ -21,12 +21,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path as FSPath
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import aiohttp
 import trafilatura
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
+from fastmcp import FastMCP
 from pydantic import BaseModel, Field, constr
 from sse_starlette.sse import EventSourceResponse
 
@@ -37,7 +38,17 @@ from orchestrator import Orchestrator, Job, JobStatus
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Searcharvester", version="2.2.0")
+mcp = FastMCP(
+    name="searcharvester",
+    instructions=(
+        "Use searcharvester_search to find information on the web. "
+        "Use searcharvester_extract to read the full content of specific URLs. "
+        "Use searcharvester_research for deep multi-source research that returns a full cited report (slow, takes minutes)."
+    ),
+)
+_mcp_app = mcp.http_app(path="/")
+
+app = FastAPI(title="Searcharvester", version="2.2.0", lifespan=_mcp_app.lifespan)
 
 # ---------- CORS ----------
 # Frontend dev server is on :9762. Prod build served by the same origin or
@@ -277,27 +288,23 @@ async def _fetch_raw_content(session: aiohttp.ClientSession, url: str) -> str | 
     return content
 
 
-@app.post("/search")
-async def search(request: SearchRequest) -> dict[str, Any]:
-    """Tavily-совместимый эндпойнт поиска."""
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-
-    logger.info(
-        "Search: q=%r engines=%s categories=%s raw=%s",
-        request.query, request.engines, request.categories, request.include_raw_content,
-    )
-
+async def _execute_search(
+    query: str,
+    max_results: int,
+    include_raw_content: bool,
+    engines: str | None,
+    categories: str | None,
+) -> list[TavilyResult]:
+    """Query SearXNG and optionally scrape raw content. Raises HTTPException on failure."""
     searxng_params = {
-        "q": request.query,
+        "q": query,
         "format": "json",
-        "categories": request.categories or "general",
-        "engines": request.engines or "google,duckduckgo,brave",
+        "categories": categories or "general",
+        "engines": engines or config.default_engines,
         "pageno": 1,
         "language": "auto",
         "safesearch": 1,
     }
-
     headers = {
         "X-Forwarded-For": "127.0.0.1",
         "X-Real-IP": "127.0.0.1",
@@ -327,9 +334,9 @@ async def search(request: SearchRequest) -> dict[str, Any]:
     searxng_results = searxng_data.get("results", [])
 
     raw_contents: dict[str, str] = {}
-    if request.include_raw_content and searxng_results:
+    if include_raw_content and searxng_results:
         urls_to_scrape = [
-            r["url"] for r in searxng_results[: request.max_results] if r.get("url")
+            r["url"] for r in searxng_results[:max_results] if r.get("url")
         ]
         async with aiohttp.ClientSession() as scrape_session:
             tasks = [_fetch_raw_content(scrape_session, u) for u in urls_to_scrape]
@@ -339,22 +346,39 @@ async def search(request: SearchRequest) -> dict[str, Any]:
                     raw_contents[url] = content
 
     results: list[TavilyResult] = []
-    for i, result in enumerate(searxng_results[: request.max_results]):
+    for i, result in enumerate(searxng_results[:max_results]):
         if not result.get("url"):
             continue
-        raw_content = raw_contents.get(result["url"]) if request.include_raw_content else None
         results.append(
             TavilyResult(
                 url=result["url"],
                 title=result.get("title", ""),
                 content=result.get("content", ""),
                 score=0.9 - (i * 0.05),
-                raw_content=raw_content,
+                raw_content=raw_contents.get(result["url"]) if include_raw_content else None,
             )
         )
 
-    response_time = time.time() - start_time
+    return results
 
+
+@app.post("/search")
+async def search(request: SearchRequest) -> dict[str, Any]:
+    """Tavily-совместимый эндпойнт поиска."""
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+    logger.info(
+        "Search: q=%r engines=%s categories=%s raw=%s",
+        request.query, request.engines, request.categories, request.include_raw_content,
+    )
+    results = await _execute_search(
+        query=request.query,
+        max_results=request.max_results,
+        include_raw_content=request.include_raw_content,
+        engines=request.engines,
+        categories=request.categories,
+    )
+    response_time = time.time() - start_time
     response = TavilyResponse(
         query=request.query,
         follow_up_questions=None,
@@ -364,7 +388,6 @@ async def search(request: SearchRequest) -> dict[str, Any]:
         response_time=response_time,
         request_id=request_id,
     )
-
     logger.info("Search done: %d results in %.2fs", len(results), response_time)
     return response.model_dump()
 
@@ -607,6 +630,135 @@ async def health() -> dict[str, Any]:
         "version": "2.2.0",
         "orchestrator": "available" if orchestrator is not None else "unavailable",
     }
+
+
+# ---------- MCP tools ----------
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Web Search"})
+async def searcharvester_search(
+    query: Annotated[str, Field(min_length=1, description="Search keywords or question")],
+    max_results: Annotated[int, Field(ge=1, le=20, description="Number of results to return (1–20)")] = 5,
+    topic: Annotated[Literal["general", "news"], Field(description="Search category; 'news' targets news engines")] = "general",
+    include_raw_content: Annotated[bool, Field(description="Fetch full page markdown for each result (slower)")] = False,
+    search_depth: Annotated[Literal["basic", "advanced"], Field(description="'advanced' forces include_raw_content=True")] = "basic",
+) -> dict[str, Any]:
+    """Search the web and return ranked results with titles, URLs, and snippets. Use for current information, facts, and general queries. To read the full content of a specific page, use searcharvester_extract instead."""
+    if search_depth == "advanced":
+        include_raw_content = True
+    try:
+        results = await _execute_search(
+            query=query,
+            max_results=max_results,
+            include_raw_content=include_raw_content,
+            engines=None,
+            categories=topic,
+        )
+    except HTTPException as exc:
+        raise RuntimeError(f"Search failed: {exc.detail}") from exc
+    return {
+        "query": query,
+        "result_count": len(results),
+        "results": [
+            {
+                "rank": i + 1,
+                "url": r.url,
+                "title": r.title,
+                "content": r.content,
+                **({"raw_content": r.raw_content} if r.raw_content is not None else {}),
+            }
+            for i, r in enumerate(results)
+        ],
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Extract Page Content"})
+async def searcharvester_extract(
+    urls: Annotated[list[str], Field(min_length=1, description="One or more URLs to extract (fetched in parallel)")],
+    extract_depth: Annotated[Literal["basic", "advanced"], Field(description="Content depth: basic → 10k chars, advanced → 25k chars")] = "basic",
+) -> dict[str, Any]:
+    """Fetch one or more URLs and return their main content as clean markdown. Navigation, ads, and boilerplate are stripped. Use when you have specific URLs to read. For discovering URLs, use searcharvester_search instead."""
+    size = "m" if extract_depth == "basic" else "l"
+
+    async def _extract_one(url: str) -> tuple[str, dict[str, Any] | None, str | None]:
+        _gc_extract_cache()
+        extract_id = _extract_id(url)
+        cached = _extract_cache.get(extract_id)
+        try:
+            if cached and cached["url"] == url:
+                title, content = cached["title"], cached["content"]
+            else:
+                title, content = await _extract_markdown_for_url(url)
+                _extract_cache[extract_id] = {
+                    "url": url,
+                    "title": title,
+                    "content": content,
+                    "created_at": time.time(),
+                }
+            resp = _build_extract_response(extract_id, url, title, content, size)
+            return url, resp, None
+        except HTTPException as exc:
+            return url, None, f"HTTP {exc.status_code}: {exc.detail}"
+        except Exception as exc:
+            return url, None, str(exc)
+
+    outcomes = await asyncio.gather(*[_extract_one(u) for u in urls])
+
+    results_list: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for url, resp, error in outcomes:
+        if resp is not None:
+            results_list.append({
+                "url": url,
+                "title": resp["title"],
+                "content": resp["content"],
+                "truncated": resp["chars"] < resp["total_chars"],
+                "chars": resp["chars"],
+                "total_chars": resp["total_chars"],
+            })
+        else:
+            failed.append({"url": url, "error": error})
+
+    if not results_list and failed:
+        raise RuntimeError(
+            f"All {len(failed)} URL(s) failed. First error: {failed[0]['error']}"
+        )
+
+    return {"results": results_list, "failed": failed}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Deep Research"})
+async def searcharvester_research(
+    query: Annotated[str, Field(min_length=1, description="Research question or topic")],
+    timeout_sec: Annotated[int, Field(ge=60, le=1800, description="Max wait time in seconds (60–1800)")] = 900,
+) -> dict[str, Any]:
+    """Run a deep research job: searches multiple sources, extracts content, and returns a full cited markdown report. This is slow (minutes). Use for thorough research questions, not quick lookups. Requires the research orchestrator (hermes) to be running."""
+    if orchestrator is None:
+        raise RuntimeError("Research unavailable: hermes binary not found on PATH.")
+    job_id = await orchestrator.spawn(query=query)
+    logger.info("MCP research job %s started for query: %r", job_id, query)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_sec
+    terminal = {JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
+    while loop.time() < deadline:
+        await asyncio.sleep(5)
+        job = orchestrator.get(job_id)
+        if job is None:
+            raise RuntimeError(f"Research job {job_id} disappeared unexpectedly.")
+        if job.status == JobStatus.completed:
+            logger.info("MCP research job %s completed in %.1fs", job_id, job.duration_sec or 0)
+            return {"job_id": job_id, "status": "completed", "report": job.report}
+        if job.status in terminal:
+            raise RuntimeError(
+                f"Research job {job_id} ended with status '{job.status.value}': {job.error or 'no details'}"
+            )
+    await orchestrator.cancel(job_id)
+    raise RuntimeError(
+        f"Research timed out after {timeout_sec}s. Job {job_id} was cancelled."
+    )
+
+
+# Mount MCP on the FastAPI app at /mcp (streamable HTTP transport)
+app.mount("/mcp", _mcp_app)
 
 
 if __name__ == "__main__":
