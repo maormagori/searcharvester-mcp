@@ -13,6 +13,7 @@ Endpoints:
 """
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path as FSPath
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import trafilatura
@@ -30,6 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field, constr
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware import Middleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tavily_client import TavilyResponse, TavilyResult
 from config_loader import config
@@ -46,7 +50,16 @@ mcp = FastMCP(
         "Use searcharvester_research for deep multi-source research that returns a full cited report (slow, takes minutes)."
     ),
 )
-_mcp_app = mcp.http_app(path="/")
+_mcp_allowed_hosts = [
+    h.strip()
+    for h in os.environ.get(
+        "MCP_ALLOWED_HOSTS", "localhost,127.0.0.1,localhost:*,127.0.0.1:*"
+    ).split(",")
+    if h.strip()
+]
+_mcp_app = mcp.http_app(path="/", middleware=[
+    Middleware(TrustedHostMiddleware, allowed_hosts=_mcp_allowed_hosts)
+])
 
 app = FastAPI(title="Searcharvester", version="2.2.0", lifespan=_mcp_app.lifespan)
 
@@ -117,6 +130,33 @@ orchestrator: Orchestrator | None = _build_orchestrator()
 SIZE_LIMITS: dict[str, int] = {"s": 5000, "m": 10000, "l": 25000}
 PAGE_SIZE = 25000
 EXTRACT_CACHE_TTL_SEC = 1800  # 30 минут
+EXTRACT_MAX_CONCURRENCY = int(os.environ.get("EXTRACT_MAX_CONCURRENCY", "5"))
+_extract_semaphore = asyncio.Semaphore(EXTRACT_MAX_CONCURRENCY)
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+
+def _validate_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL scheme '{parsed.scheme}' not allowed — use http or https")
+    hostname = parsed.hostname or ""
+    if hostname.lower() in ("localhost", ""):
+        raise ValueError(f"URL hostname '{hostname}' not allowed")
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return  # hostname is a domain name, not an IP literal — allow through
+    if any(addr in net for net in _PRIVATE_NETWORKS):
+        raise ValueError(f"URL resolves to a private/reserved address: {hostname}")
 
 # id -> {"url", "title", "content", "created_at"}
 _extract_cache: dict[str, dict[str, Any]] = {}
@@ -397,6 +437,10 @@ async def search(request: SearchRequest) -> dict[str, Any]:
 @app.post("/extract")
 async def extract(req: ExtractRequest) -> dict[str, Any]:
     """Извлекает main-content страницы в markdown. Возвращает id для пагинации (size=f)."""
+    try:
+        _validate_url(req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     _gc_extract_cache()
     extract_id = _extract_id(req.url)
 
@@ -643,6 +687,7 @@ async def searcharvester_search(
     search_depth: Annotated[Literal["basic", "advanced"], Field(description="'advanced' forces include_raw_content=True")] = "basic",
 ) -> dict[str, Any]:
     """Search the web and return ranked results with titles, URLs, and snippets. Use for current information, facts, and general queries. To read the full content of a specific page, use searcharvester_extract instead."""
+    logger.info("MCP search: q=%r max_results=%d depth=%s raw=%s", query, max_results, search_depth, include_raw_content)
     if search_depth == "advanced":
         include_raw_content = True
     try:
@@ -655,6 +700,7 @@ async def searcharvester_search(
         )
     except HTTPException as exc:
         raise RuntimeError(f"Search failed: {exc.detail}") from exc
+    logger.info("MCP search done: %d results", len(results))
     return {
         "query": query,
         "result_count": len(results),
@@ -677,7 +723,17 @@ async def searcharvester_extract(
     extract_depth: Annotated[Literal["basic", "advanced"], Field(description="Content depth: basic → 10k chars, advanced → 25k chars")] = "basic",
 ) -> dict[str, Any]:
     """Fetch one or more URLs and return their main content as clean markdown. Navigation, ads, and boilerplate are stripped. Use when you have specific URLs to read. For discovering URLs, use searcharvester_search instead."""
+    logger.info("MCP extract: %d URL(s) depth=%s", len(urls), extract_depth)
     size = "m" if extract_depth == "basic" else "l"
+
+    failed: list[dict[str, Any]] = []
+    valid_urls: list[str] = []
+    for url in urls:
+        try:
+            _validate_url(url)
+            valid_urls.append(url)
+        except ValueError as exc:
+            failed.append({"url": url, "error": str(exc)})
 
     async def _extract_one(url: str) -> tuple[str, dict[str, Any] | None, str | None]:
         _gc_extract_cache()
@@ -701,10 +757,13 @@ async def searcharvester_extract(
         except Exception as exc:
             return url, None, str(exc)
 
-    outcomes = await asyncio.gather(*[_extract_one(u) for u in urls])
+    async def _extract_one_limited(url: str) -> tuple[str, dict[str, Any] | None, str | None]:
+        async with _extract_semaphore:
+            return await _extract_one(url)
+
+    outcomes = await asyncio.gather(*[_extract_one_limited(u) for u in valid_urls])
 
     results_list: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
     for url, resp, error in outcomes:
         if resp is not None:
             results_list.append({
@@ -723,6 +782,7 @@ async def searcharvester_extract(
             f"All {len(failed)} URL(s) failed. First error: {failed[0]['error']}"
         )
 
+    logger.info("MCP extract done: %d ok, %d failed", len(results_list), len(failed))
     return {"results": results_list, "failed": failed}
 
 
