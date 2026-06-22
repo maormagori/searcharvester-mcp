@@ -314,21 +314,6 @@ Harness in [`bench/`](bench/).
 | 🎛 Search sources | Opaque | You control the engines |
 | 🤖 Deep research | Add-on product | Built-in via `/research` |
 
-## ⚙️ Configuration
-
-`config.yaml` — single file, shared by SearXNG and the adapter. See [CONFIG_SETUP.md](CONFIG_SETUP.md) and [`docs/en/getting-started.md`](docs/en/getting-started.md).
-
-LLM credentials for `/research` go in `.env` (or the environment of whoever runs `docker compose up`) — only passed through to the spawned Hermes container.
-
-## 🐳 Pre-built image
-
-Published to GitHub Container Registry — public:
-
-- `ghcr.io/vakovalskii/searcharvester:latest`
-- `ghcr.io/vakovalskii/searcharvester:2.1.0`
-
-`docker-compose.yaml` uses `image:` by default — no build needed. For local dev: `docker compose up --build`.
-
 ## MCP
 
 The adapter exposes four tools via the Model Context Protocol:
@@ -394,6 +379,21 @@ With the Docker stack already running, point the client at the existing containe
 > Note: in stdio mode the HTTP API (`/search`, `/extract`, `/research`) is not served — only the MCP tools are available. The `/research` tool still works because the orchestrator is initialised in the same process.
 
 ---
+
+## ⚙️ Configuration
+
+`config.yaml` — single file, shared by SearXNG and the adapter. See [CONFIG_SETUP.md](CONFIG_SETUP.md) and [`docs/en/getting-started.md`](docs/en/getting-started.md).
+
+LLM credentials for `/research` go in `.env` (or the environment of whoever runs `docker compose up`) — only passed through to the spawned Hermes container.
+
+## 🐳 Pre-built image
+
+Published to GitHub Container Registry — public:
+
+- `ghcr.io/vakovalskii/searcharvester:latest`
+- `ghcr.io/vakovalskii/searcharvester:2.1.0`
+
+`docker-compose.yaml` uses `image:` by default — no build needed. For local dev: `docker compose up --build`.
 
 ## 🔧 Development
 
