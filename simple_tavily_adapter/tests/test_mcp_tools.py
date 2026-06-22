@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 import main
-from main import searcharvester_search, searcharvester_extract, searcharvester_research, mcp
+from main import searcharvester_search, searcharvester_extract, searcharvester_extract_page, searcharvester_research, mcp
 from orchestrator import Job, JobStatus
 from tavily_client import TavilyResult
 
@@ -120,3 +120,60 @@ async def test_research_completes_and_returns_report(monkeypatch):
 
     assert out["job_id"] == "job-123"
     assert out["report"] == "# Report"
+
+
+# ---------- searcharvester_search: engines param ----------
+
+async def test_search_engines_passed_through(monkeypatch):
+    mock_search = AsyncMock(return_value=[])
+    monkeypatch.setattr(main, "_execute_search", mock_search)
+
+    await searcharvester_search(query="test", engines="google,brave")
+
+    assert mock_search.call_args.kwargs["engines"] == "google,brave"
+
+
+async def test_search_engines_defaults_to_none(monkeypatch):
+    mock_search = AsyncMock(return_value=[])
+    monkeypatch.setattr(main, "_execute_search", mock_search)
+
+    await searcharvester_search(query="test")
+
+    assert mock_search.call_args.kwargs["engines"] is None
+
+
+# ---------- searcharvester_extract_page ----------
+
+async def test_extract_page_returns_first_page(monkeypatch):
+    import time as _time
+    extract_id = "abcd1234abcd1234"
+    monkeypatch.setitem(
+        main._extract_cache,
+        extract_id,
+        {"url": "https://example.com", "title": "T", "content": "x" * 30000, "created_at": _time.time()},
+    )
+
+    out = await searcharvester_extract_page(id=extract_id, page=1)
+
+    assert out["id"] == extract_id
+    assert out["chars"] == 25000
+    assert out["pages"]["current"] == 1
+    assert out["pages"]["total"] == 2
+
+
+async def test_extract_page_unknown_id_raises():
+    with pytest.raises(RuntimeError, match="not found or expired"):
+        await searcharvester_extract_page(id="0000000000000000", page=1)
+
+
+async def test_extract_page_out_of_range_raises(monkeypatch):
+    import time as _time
+    extract_id = "bbbb1234bbbb1234"
+    monkeypatch.setitem(
+        main._extract_cache,
+        extract_id,
+        {"url": "https://example.com", "title": "T", "content": "x" * 100, "created_at": _time.time()},
+    )
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        await searcharvester_extract_page(id=extract_id, page=99)

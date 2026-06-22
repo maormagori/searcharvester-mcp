@@ -20,6 +20,7 @@ import math
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path as FSPath
 from typing import Annotated, Any, Literal
@@ -42,14 +43,34 @@ from orchestrator import Orchestrator, Job, JobStatus
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_http_session: aiohttp.ClientSession | None = None
+_MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "http")
+_SEARCH_TIMEOUT_SEC = int(os.environ.get("SEARCH_TIMEOUT_SEC", "30"))
+_EXTRACT_TIMEOUT_SEC = int(os.environ.get("EXTRACT_TIMEOUT_SEC", "30"))
+
+
+@asynccontextmanager
+async def _mcp_lifespan(server):
+    """Runs under both HTTP and stdio transports — the only place _http_session is created."""
+    global _http_session
+    _http_session = aiohttp.ClientSession()
+    yield
+    await _http_session.close()
+    _http_session = None
+
+
 mcp = FastMCP(
     name="searcharvester",
+    lifespan=_mcp_lifespan,
     instructions=(
         "Use searcharvester_search to find information on the web. "
         "Use searcharvester_extract to read the full content of specific URLs. "
+        "Use searcharvester_extract_page to read subsequent pages of long documents "
+        "(requires id from searcharvester_extract with size=f). "
         "Use searcharvester_research for deep multi-source research that returns a full cited report (slow, takes minutes)."
     ),
 )
+
 _mcp_allowed_hosts = [
     h.strip()
     for h in os.environ.get(
@@ -61,7 +82,47 @@ _mcp_app = mcp.http_app(path="/", middleware=[
     Middleware(TrustedHostMiddleware, allowed_hosts=_mcp_allowed_hosts)
 ])
 
-app = FastAPI(title="Searcharvester", version="2.2.0", lifespan=_mcp_app.lifespan)
+
+async def _startup_health_check() -> None:
+    try:
+        async with _http_session.get(
+            f"{config.searxng_url}/",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status < 500:
+                logger.info("SearXNG reachable at %s (HTTP %d)", config.searxng_url, resp.status)
+            else:
+                logger.warning("Startup: SearXNG at %s returned HTTP %d", config.searxng_url, resp.status)
+    except Exception as exc:
+        logger.warning("Startup: SearXNG at %s unreachable: %s", config.searxng_url, exc)
+
+
+async def _with_retry(make_coro, *, backoff: float = 1.0):
+    for attempt in range(2):
+        try:
+            return await make_coro()
+        except (aiohttp.ClientConnectionError, aiohttp.ServerConnectionError) as exc:
+            if attempt == 1:
+                raise
+            logger.warning("Transient connection error, retrying: %s", exc)
+            await asyncio.sleep(backoff)
+        except HTTPException as exc:
+            if exc.status_code in (502, 504) and attempt == 0:
+                logger.warning("Transient HTTP %d, retrying", exc.status_code)
+                await asyncio.sleep(backoff)
+            else:
+                raise
+
+
+@asynccontextmanager
+async def _lifespan(fastapi_app):
+    async with _mcp_app.lifespan(fastapi_app):
+        # _http_session is now live (created by _mcp_lifespan above)
+        await _startup_health_check()
+        yield
+
+
+app = FastAPI(title="Searcharvester", version="2.2.0", lifespan=_lifespan)
 
 # ---------- CORS ----------
 # Frontend dev server is on :9762. Prod build served by the same origin or
@@ -193,26 +254,27 @@ def _extract_id(url: str) -> str:
 
 
 def _gc_extract_cache() -> None:
-    """Удаляет просроченные записи из in-memory кеша."""
     now = time.time()
     expired = [k for k, v in _extract_cache.items() if now - v["created_at"] > EXTRACT_CACHE_TTL_SEC]
     for k in expired:
         _extract_cache.pop(k, None)
 
 
-async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
-    async with session.get(
-        url,
-        timeout=aiohttp.ClientTimeout(total=config.scraper_timeout),
-        headers={"User-Agent": config.scraper_user_agent},
-        allow_redirects=True,
-    ) as response:
-        if response.status != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Не удалось скачать {url}: HTTP {response.status}",
-            )
-        return await response.text()
+async def _fetch_html(url: str) -> str:
+    async def _do():
+        async with _http_session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=_EXTRACT_TIMEOUT_SEC),
+            headers={"User-Agent": config.scraper_user_agent},
+            allow_redirects=True,
+        ) as response:
+            if response.status != 200:
+                raise HTTPException(
+                    status_code=response.status,
+                    detail=f"Не удалось скачать {url}: HTTP {response.status}",
+                )
+            return await response.text()
+    return await _with_retry(_do)
 
 
 def _extract_markdown(html: str) -> tuple[str, str]:
@@ -243,8 +305,7 @@ def _extract_markdown(html: str) -> tuple[str, str]:
 
 
 async def _extract_markdown_for_url(url: str) -> tuple[str, str]:
-    async with aiohttp.ClientSession() as session:
-        html = await _fetch_html(session, url)
+    html = await _fetch_html(url)
     return _extract_markdown(html)
 
 
@@ -294,10 +355,10 @@ def _build_extract_response(
 
 # ---------- /search ----------
 
-async def _fetch_raw_content(session: aiohttp.ClientSession, url: str) -> str | None:
-    """Скрапит страницу, возвращает markdown-контент (trafilatura) или None при ошибке."""
+async def _fetch_raw_content(url: str) -> str | None:
+    """Scrapes a page and returns markdown content (trafilatura) or None on error."""
     try:
-        async with session.get(
+        async with _http_session.get(
             url,
             timeout=aiohttp.ClientTimeout(total=config.scraper_timeout),
             headers={"User-Agent": config.scraper_user_agent},
@@ -352,24 +413,28 @@ async def _execute_search(
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                f"{config.searxng_url}/search",
-                data=searxng_params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as response:
-                if response.status != 200:
-                    raise HTTPException(status_code=500, detail="SearXNG request failed")
-                searxng_data = await response.json()
-        except aiohttp.TimeoutError:
-            raise HTTPException(status_code=504, detail="SearXNG timeout")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error("SearXNG error: %s", e)
-            raise HTTPException(status_code=500, detail="Search service unavailable")
+    async def _do_search():
+        async with _http_session.post(
+            f"{config.searxng_url}/search",
+            data=searxng_params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=_SEARCH_TIMEOUT_SEC),
+        ) as response:
+            if response.status in (502, 504):
+                raise HTTPException(status_code=response.status, detail="SearXNG upstream error")
+            if response.status != 200:
+                raise HTTPException(status_code=500, detail="SearXNG request failed")
+            return await response.json()
+
+    try:
+        searxng_data = await _with_retry(_do_search)
+    except aiohttp.TimeoutError:
+        raise HTTPException(status_code=504, detail="SearXNG timeout")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("SearXNG error: %s", e)
+        raise HTTPException(status_code=500, detail="Search service unavailable")
 
     searxng_results = searxng_data.get("results", [])
 
@@ -378,12 +443,11 @@ async def _execute_search(
         urls_to_scrape = [
             r["url"] for r in searxng_results[:max_results] if r.get("url")
         ]
-        async with aiohttp.ClientSession() as scrape_session:
-            tasks = [_fetch_raw_content(scrape_session, u) for u in urls_to_scrape]
-            page_contents = await asyncio.gather(*tasks, return_exceptions=True)
-            for url, content in zip(urls_to_scrape, page_contents):
-                if isinstance(content, str) and content:
-                    raw_contents[url] = content
+        tasks = [_fetch_raw_content(u) for u in urls_to_scrape]
+        page_contents = await asyncio.gather(*tasks, return_exceptions=True)
+        for url, content in zip(urls_to_scrape, page_contents):
+            if isinstance(content, str) and content:
+                raw_contents[url] = content
 
     results: list[TavilyResult] = []
     for i, result in enumerate(searxng_results[:max_results]):
@@ -618,8 +682,6 @@ async def research_events(job_id: str):
                 "event": ev.type,
                 "data": json.dumps(ev.to_dict(), ensure_ascii=False),
             }
-        # Final status event (handy for clients that only care about the
-        # outcome and don't want to parse the last `done` payload).
         final = orch.get(job_id)
         if final is not None:
             yield {
@@ -685,9 +747,10 @@ async def searcharvester_search(
     topic: Annotated[Literal["general", "news"], Field(description="Search category; 'news' targets news engines")] = "general",
     include_raw_content: Annotated[bool, Field(description="Fetch full page markdown for each result (slower)")] = False,
     search_depth: Annotated[Literal["basic", "advanced"], Field(description="'advanced' forces include_raw_content=True")] = "basic",
+    engines: Annotated[str | None, Field(description="Comma-separated engine list, e.g. 'google,brave,duckduckgo'. Defaults to server config.")] = None,
 ) -> dict[str, Any]:
     """Search the web and return ranked results with titles, URLs, and snippets. Use for current information, facts, and general queries. To read the full content of a specific page, use searcharvester_extract instead."""
-    logger.info("MCP search: q=%r max_results=%d depth=%s raw=%s", query, max_results, search_depth, include_raw_content)
+    logger.info("MCP search: q=%r max_results=%d depth=%s raw=%s engines=%s", query, max_results, search_depth, include_raw_content, engines)
     if search_depth == "advanced":
         include_raw_content = True
     try:
@@ -695,7 +758,7 @@ async def searcharvester_search(
             query=query,
             max_results=max_results,
             include_raw_content=include_raw_content,
-            engines=None,
+            engines=engines,
             categories=topic,
         )
     except HTTPException as exc:
@@ -753,37 +816,66 @@ async def searcharvester_extract(
             resp = _build_extract_response(extract_id, url, title, content, size)
             return url, resp, None
         except HTTPException as exc:
+            # Expected failures (404, 422, etc.) are reported in the failed list,
+            # not raised — callers can still inspect why each URL failed.
             return url, None, f"HTTP {exc.status_code}: {exc.detail}"
-        except Exception as exc:
-            return url, None, str(exc)
+        # Generic exceptions (connection errors, unexpected crashes) propagate up;
+        # asyncio.gather captures them via return_exceptions=True.
 
     async def _extract_one_limited(url: str) -> tuple[str, dict[str, Any] | None, str | None]:
         async with _extract_semaphore:
             return await _extract_one(url)
 
-    outcomes = await asyncio.gather(*[_extract_one_limited(u) for u in valid_urls])
+    outcomes = await asyncio.gather(
+        *[_extract_one_limited(u) for u in valid_urls],
+        return_exceptions=True,
+    )
 
     results_list: list[dict[str, Any]] = []
-    for url, resp, error in outcomes:
-        if resp is not None:
-            results_list.append({
-                "url": url,
-                "title": resp["title"],
-                "content": resp["content"],
-                "truncated": resp["chars"] < resp["total_chars"],
-                "chars": resp["chars"],
-                "total_chars": resp["total_chars"],
-            })
+    hard_failures = 0
+    for url, outcome in zip(valid_urls, outcomes):
+        if isinstance(outcome, Exception):
+            failed.append({"url": url, "error": str(outcome)})
+            hard_failures += 1
         else:
-            failed.append({"url": url, "error": error})
+            _, resp, error = outcome
+            if resp is not None:
+                results_list.append({
+                    "url": url,
+                    "title": resp["title"],
+                    "content": resp["content"],
+                    "truncated": resp["chars"] < resp["total_chars"],
+                    "chars": resp["chars"],
+                    "total_chars": resp["total_chars"],
+                })
+            else:
+                failed.append({"url": url, "error": error})
 
-    if not results_list and failed:
+    if not results_list and hard_failures == len(valid_urls) and hard_failures > 0:
         raise RuntimeError(
             f"All {len(failed)} URL(s) failed. First error: {failed[0]['error']}"
         )
 
     logger.info("MCP extract done: %d ok, %d failed", len(results_list), len(failed))
     return {"results": results_list, "failed": failed}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Extract Page (Paginated)"})
+async def searcharvester_extract_page(
+    id: Annotated[str, Field(min_length=16, max_length=16, description="Extract ID from a prior searcharvester_extract call with size=f")],
+    page: Annotated[int, Field(ge=1, description="Page number (1-indexed)")],
+) -> dict[str, Any]:
+    """Read a specific page of a previously extracted long document. The id comes from a prior searcharvester_extract call — only meaningful when the document was longer than 25k chars."""
+    _gc_extract_cache()
+    cached = _extract_cache.get(id)
+    if not cached:
+        raise RuntimeError(
+            f"Extract id {id!r} not found or expired (TTL 30 min). Call searcharvester_extract first."
+        )
+    try:
+        return _build_extract_response(id, cached["url"], cached["title"], cached["content"], size="f", page=page)
+    except HTTPException as exc:
+        raise RuntimeError(f"Page {page} out of range: {exc.detail}") from exc
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Deep Research"})
@@ -817,10 +909,12 @@ async def searcharvester_research(
     )
 
 
-# Mount MCP on the FastAPI app at /mcp (streamable HTTP transport)
 app.mount("/mcp", _mcp_app)
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=config.server_host, port=config.server_port)
+    if _MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        import uvicorn
+        uvicorn.run(app, host=config.server_host, port=config.server_port)
