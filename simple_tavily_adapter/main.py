@@ -2,13 +2,13 @@
 FastAPI server that provides Tavily-compatible API using SearXNG backend.
 
 Endpoints:
-- POST /search                       — Tavily-совместимый поиск
-- POST /extract                      — Извлечение страницы в markdown (s/m/l/f)
-- GET  /extract/{id}/{page}          — Пагинация для size=f
-- POST /research                     — Запустить deep-research задачу (ephemeral Hermes)
-- GET  /research/{job_id}            — Статус / готовый report.md
-- GET  /research/{job_id}/logs       — Hermes stdout/stderr (для отладки)
-- DELETE /research/{job_id}          — Cancel активной задачи
+- POST /search                       — Tavily-compatible search
+- POST /extract                      — Fetch a URL and return markdown (s/m/l/f presets)
+- GET  /extract/{id}/{page}          — Pagination for size=f
+- POST /research                     — Start a deep-research job (ephemeral Hermes)
+- GET  /research/{job_id}            — Job status / finished report
+- GET  /research/{job_id}/logs       — Hermes stdout/stderr (for debugging)
+- DELETE /research/{job_id}          — Cancel an active job
 - GET  /health                       — health-check
 """
 import asyncio
@@ -190,22 +190,13 @@ orchestrator: Orchestrator | None = _build_orchestrator()
 
 SIZE_LIMITS: dict[str, int] = {"s": 5000, "m": 10000, "l": 25000}
 PAGE_SIZE = 25000
-EXTRACT_CACHE_TTL_SEC = 1800  # 30 минут
-EXTRACT_MAX_CONCURRENCY = int(os.environ.get("EXTRACT_MAX_CONCURRENCY", "5"))
+EXTRACT_CACHE_TTL_SEC = 1800  # 30 minutes
+EXTRACT_MAX_CONCURRENCY = int(os.environ.get("EXTRACT_MAX_CONCURRENCY", "5"))  # caps parallel URL fetches — higher values risk rate-limiting by target hosts
 _extract_semaphore = asyncio.Semaphore(EXTRACT_MAX_CONCURRENCY)
-
-_PRIVATE_NETWORKS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-]
 
 
 def _validate_url(url: str) -> None:
+    """Guard against SSRF — rejects non-HTTP schemes, localhost, and private/reserved IP ranges."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"URL scheme '{parsed.scheme}' not allowed — use http or https")
@@ -216,7 +207,7 @@ def _validate_url(url: str) -> None:
         addr = ipaddress.ip_address(hostname)
     except ValueError:
         return  # hostname is a domain name, not an IP literal — allow through
-    if any(addr in net for net in _PRIVATE_NETWORKS):
+    if addr.is_private:
         raise ValueError(f"URL resolves to a private/reserved address: {hostname}")
 
 # id -> {"url", "title", "content", "created_at"}
@@ -231,7 +222,7 @@ class SearchRequest(BaseModel):
     include_raw_content: bool = False
     engines: str | None = Field(
         default=None,
-        description="Через запятую: google,duckduckgo,brave,bing,... Пусто → дефолт из кода",
+        description="Comma-separated: google,duckduckgo,brave,bing,... Empty → uses configured default.",
     )
     categories: str | None = Field(
         default=None,
@@ -243,7 +234,7 @@ class ExtractRequest(BaseModel):
     url: str
     size: Literal["s", "m", "l", "f"] = Field(
         default="m",
-        description="s=5000, m=10000, l=25000 символов (обрезка), f=полный с пагинацией",
+        description="s=5 000, m=10 000, l=25 000 chars (truncated); f=full content with pagination",
     )
 
 
@@ -271,14 +262,14 @@ async def _fetch_html(url: str) -> str:
             if response.status != 200:
                 raise HTTPException(
                     status_code=response.status,
-                    detail=f"Не удалось скачать {url}: HTTP {response.status}",
+                    detail=f"Failed to fetch {url}: HTTP {response.status}",
                 )
             return await response.text()
     return await _with_retry(_do)
 
 
 def _extract_markdown(html: str) -> tuple[str, str]:
-    """Возвращает (title, markdown_content). Бросает HTTPException, если контента нет."""
+    """Return (title, markdown_content). Raises HTTPException(422) if trafilatura yields nothing."""
     content = trafilatura.extract(
         html,
         output_format="markdown",
@@ -290,7 +281,7 @@ def _extract_markdown(html: str) -> tuple[str, str]:
     if not content:
         raise HTTPException(
             status_code=422,
-            detail="Не удалось извлечь основной контент страницы (пусто после очистки)",
+            detail="Failed to extract main content from page (empty after cleanup)",
         )
 
     title = ""
@@ -324,7 +315,7 @@ def _build_extract_response(
         if page > total_pages:
             raise HTTPException(
                 status_code=404,
-                detail=f"Страница {page} не существует (всего {total_pages})",
+                detail=f"Page {page} does not exist (total: {total_pages})",
             )
         start = (page - 1) * PAGE_SIZE
         chunk = full_content[start : start + PAGE_SIZE]
@@ -413,7 +404,7 @@ async def _execute_search(
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    async def _do_search():
+    async def _do_search():  # inner closure so _with_retry can re-invoke it on transient failure
         async with _http_session.post(
             f"{config.searxng_url}/search",
             data=searxng_params,
@@ -468,7 +459,7 @@ async def _execute_search(
 
 @app.post("/search")
 async def search(request: SearchRequest) -> dict[str, Any]:
-    """Tavily-совместимый эндпойнт поиска."""
+    """Tavily-compatible search endpoint."""
     start_time = time.time()
     request_id = str(uuid.uuid4())
     logger.info(
@@ -500,7 +491,7 @@ async def search(request: SearchRequest) -> dict[str, Any]:
 
 @app.post("/extract")
 async def extract(req: ExtractRequest) -> dict[str, Any]:
-    """Извлекает main-content страницы в markdown. Возвращает id для пагинации (size=f)."""
+    """Fetch a URL and return its main content as markdown. Returns an id for pagination (size=f)."""
     try:
         _validate_url(req.url)
     except ValueError as exc:
@@ -528,13 +519,13 @@ async def extract_page(
     extract_id: str = Path(..., min_length=16, max_length=16),
     page: int = Path(..., ge=1),
 ) -> dict[str, Any]:
-    """Возвращает page-ую страницу ранее извлечённого контента (только для size=f)."""
+    """Return a subsequent page of previously extracted content (size=f only)."""
     _gc_extract_cache()
     cached = _extract_cache.get(extract_id)
     if not cached:
         raise HTTPException(
             status_code=404,
-            detail="id не найден или просрочен (TTL 30 мин). Повторите POST /extract.",
+            detail="id not found or expired (TTL 30 min). Repeat POST /extract.",
         )
     return _build_extract_response(
         extract_id, cached["url"], cached["title"], cached["content"], size="f", page=page,
@@ -682,6 +673,8 @@ async def research_events(job_id: str):
                 "event": ev.type,
                 "data": json.dumps(ev.to_dict(), ensure_ascii=False),
             }
+        # Final status event (handy for clients that only care about the
+        # outcome and don't want to parse the last `done` payload).
         final = orch.get(job_id)
         if final is not None:
             yield {
