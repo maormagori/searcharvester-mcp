@@ -419,7 +419,7 @@ async def _execute_search(
 
     try:
         searxng_data = await _with_retry(_do_search)
-    except aiohttp.TimeoutError:
+    except (aiohttp.ServerTimeoutError, asyncio.TimeoutError):
         raise HTTPException(status_code=504, detail="SearXNG timeout")
     except HTTPException:
         raise
