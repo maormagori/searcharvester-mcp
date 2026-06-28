@@ -414,7 +414,7 @@ async def _execute_search(
             if response.status in (502, 504):
                 raise HTTPException(status_code=response.status, detail="SearXNG upstream error")
             if response.status != 200:
-                raise HTTPException(status_code=500, detail="SearXNG request failed")
+                raise HTTPException(status_code=500, detail=f"SearXNG request failed (HTTP {response.status})")
             return await response.json()
 
     try:
