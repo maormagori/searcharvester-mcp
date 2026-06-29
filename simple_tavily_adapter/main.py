@@ -59,16 +59,27 @@ async def _mcp_lifespan(server):
     _http_session = None
 
 
+_LLM_ENV_KEYS = [
+    "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "OLLAMA_BASE_URL", "NOUS_API_KEY",
+]
+_llm_configured = any(os.environ.get(k) for k in _LLM_ENV_KEYS)
+_mcp_instructions = (
+    "Use searcharvester_search to find information on the web. "
+    "Use searcharvester_extract to read the full content of specific URLs. "
+    "Use searcharvester_extract_page to read subsequent pages of long documents "
+    "(requires id from searcharvester_extract with size=f). "
+    + (
+        "Use searcharvester_research for deep multi-source research that returns a full cited report (slow, takes minutes)."
+        if _llm_configured else ""
+    )
+)
 mcp = FastMCP(
     name="searcharvester",
     lifespan=_mcp_lifespan,
-    instructions=(
-        "Use searcharvester_search to find information on the web. "
-        "Use searcharvester_extract to read the full content of specific URLs. "
-        "Use searcharvester_extract_page to read subsequent pages of long documents "
-        "(requires id from searcharvester_extract with size=f). "
-        "Use searcharvester_research for deep multi-source research that returns a full cited report (slow, takes minutes)."
-    ),
+    instructions=_mcp_instructions,
 )
 
 _mcp_allowed_hosts = [
@@ -184,6 +195,11 @@ def _build_orchestrator() -> Orchestrator | None:
 
 
 orchestrator: Orchestrator | None = _build_orchestrator()
+
+_research_enabled = orchestrator is not None and _llm_configured
+if not _research_enabled:
+    logger.info("Research tool disabled: no LLM credentials configured")
+
 
 
 # ---------- Extract constants ----------
@@ -871,35 +887,34 @@ async def searcharvester_extract_page(
         raise RuntimeError(f"Page {page} out of range: {exc.detail}") from exc
 
 
-@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Deep Research"})
-async def searcharvester_research(
-    query: Annotated[str, Field(min_length=1, description="Research question or topic")],
-    timeout_sec: Annotated[int, Field(ge=60, le=1800, description="Max wait time in seconds (60–1800)")] = 900,
-) -> dict[str, Any]:
-    """Run a deep research job: searches multiple sources, extracts content, and returns a full cited markdown report. This is slow (minutes). Use for thorough research questions, not quick lookups. Requires the research orchestrator (hermes) to be running."""
-    if orchestrator is None:
-        raise RuntimeError("Research unavailable: hermes binary not found on PATH.")
-    job_id = await orchestrator.spawn(query=query)
-    logger.info("MCP research job %s started for query: %r", job_id, query)
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout_sec
-    terminal = {JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
-    while loop.time() < deadline:
-        await asyncio.sleep(5)
-        job = orchestrator.get(job_id)
-        if job is None:
-            raise RuntimeError(f"Research job {job_id} disappeared unexpectedly.")
-        if job.status == JobStatus.completed:
-            logger.info("MCP research job %s completed in %.1fs", job_id, job.duration_sec or 0)
-            return {"job_id": job_id, "status": "completed", "report": job.report}
-        if job.status in terminal:
-            raise RuntimeError(
-                f"Research job {job_id} ended with status '{job.status.value}': {job.error or 'no details'}"
-            )
-    await orchestrator.cancel(job_id)
-    raise RuntimeError(
-        f"Research timed out after {timeout_sec}s. Job {job_id} was cancelled."
-    )
+if _research_enabled:
+    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Deep Research"})
+    async def searcharvester_research(
+        query: Annotated[str, Field(min_length=1, description="Research question or topic")],
+        timeout_sec: Annotated[int, Field(ge=60, le=1800, description="Max wait time in seconds (60–1800)")] = 900,
+    ) -> dict[str, Any]:
+        """Run a deep research job: searches multiple sources, extracts content, and returns a full cited markdown report. This is slow (minutes). Use for thorough research questions, not quick lookups. Requires the research orchestrator (hermes) to be running."""
+        job_id = await orchestrator.spawn(query=query)
+        logger.info("MCP research job %s started for query: %r", job_id, query)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_sec
+        terminal = {JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
+        while loop.time() < deadline:
+            await asyncio.sleep(5)
+            job = orchestrator.get(job_id)
+            if job is None:
+                raise RuntimeError(f"Research job {job_id} disappeared unexpectedly.")
+            if job.status == JobStatus.completed:
+                logger.info("MCP research job %s completed in %.1fs", job_id, job.duration_sec or 0)
+                return {"job_id": job_id, "status": "completed", "report": job.report}
+            if job.status in terminal:
+                raise RuntimeError(
+                    f"Research job {job_id} ended with status '{job.status.value}': {job.error or 'no details'}"
+                )
+        await orchestrator.cancel(job_id)
+        raise RuntimeError(
+            f"Research timed out after {timeout_sec}s. Job {job_id} was cancelled."
+        )
 
 
 app.mount("/mcp", _mcp_app)
