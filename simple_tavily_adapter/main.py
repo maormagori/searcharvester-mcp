@@ -60,7 +60,7 @@ async def _mcp_lifespan(server):
 
 
 _LLM_ENV_KEYS = [
-    "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "CUSTOM_BASE_URL",
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY", "GOOGLE_API_KEY",
     "OLLAMA_BASE_URL", "NOUS_API_KEY",
@@ -168,12 +168,12 @@ def _build_orchestrator() -> Orchestrator | None:
     jobs_dir.mkdir(parents=True, exist_ok=True)
 
     pass_env_keys = [
-        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "CUSTOM_BASE_URL",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY", "GOOGLE_API_KEY",
         "OLLAMA_API_KEY", "OLLAMA_BASE_URL",
-        "NOUS_API_KEY",
+        "NOUS_API_KEY", "HERMES_INFERENCE_PROVIDER",
     ]
     env = {k: os.environ[k] for k in pass_env_keys if k in os.environ}
 

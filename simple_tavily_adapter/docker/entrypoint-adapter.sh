@@ -35,14 +35,25 @@ source "${INSTALL_DIR}/.venv/bin/activate"
 
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
 
-[ ! -f "$HERMES_HOME/.env" ]        && cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env" 2>/dev/null || true
-[ ! -f "$HERMES_HOME/config.yaml" ] && cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml" 2>/dev/null || true
-[ ! -f "$HERMES_HOME/SOUL.md" ]     && cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md" 2>/dev/null || true
+[ ! -f "$HERMES_HOME/.env" ] && cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env" 2>/dev/null || true
+if [ ! -f "$HERMES_HOME/config.yaml" ]; then
+    cp /app/hermes-data/config.yaml "$HERMES_HOME/config.yaml" 2>/dev/null \
+        || cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml" 2>/dev/null \
+        || true
+fi
+if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
+    cp /app/hermes-data/SOUL.md "$HERMES_HOME/SOUL.md" 2>/dev/null \
+        || cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md" 2>/dev/null \
+        || true
+fi
 
 # Sync bundled skills into HERMES_HOME/skills (merges with any user-mounted
 # custom skills that sit alongside the bundle).
 if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null || true
+fi
+if [ -d /app/hermes_skills ]; then
+    cp -a /app/hermes_skills/. "$HERMES_HOME/skills/" 2>/dev/null || true
 fi
 
 exec "$@"

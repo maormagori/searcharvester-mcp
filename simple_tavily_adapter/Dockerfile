@@ -6,7 +6,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl gosu \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /tmp/requirements.txt
+COPY simple_tavily_adapter/requirements.txt /tmp/requirements.txt
 RUN uv pip install --no-cache-dir --python /opt/hermes/.venv/bin/python3 \
     -r /tmp/requirements.txt
 
@@ -29,9 +29,12 @@ print('patched _use_streaming = False')
 PY
 
 RUN mkdir -p /app && chown hermes:hermes /app
-COPY --chown=hermes:hermes . /app/
+COPY --chown=hermes:hermes simple_tavily_adapter/ /app/
+COPY --chown=hermes:hermes hermes-data/SOUL.md /app/hermes-data/SOUL.md
+COPY --chown=hermes:hermes hermes-data/config.yaml /app/hermes-data/config.yaml
+COPY --chown=hermes:hermes hermes_skills/ /app/hermes_skills/
 
-COPY --chown=root:root docker/entrypoint-adapter.sh /entrypoint-adapter.sh
+COPY --chown=root:root simple_tavily_adapter/docker/entrypoint-adapter.sh /entrypoint-adapter.sh
 RUN chmod +x /entrypoint-adapter.sh
 
 WORKDIR /app

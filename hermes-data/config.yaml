@@ -42,9 +42,13 @@ model:
   # Can also be overridden with --provider flag or HERMES_INFERENCE_PROVIDER env var.
   provider: "custom"
   
-  # API configuration (falls back to OPENROUTER_API_KEY env var)
+  # API configuration — left empty in the versioned template on purpose.
+  # Set CUSTOM_BASE_URL / OPENAI_API_KEY in the environment (.env /
+  # docker-compose.yaml) to point this at your own OpenAI-compatible backend.
+  # (OPENAI_BASE_URL is not read for endpoint resolution — CUSTOM_BASE_URL is
+  # the env var Hermes actually consults for a "custom" provider base_url.)
   # api_key: "your-key-here"  # Uncomment to set here instead of .env
-  base_url: "http://109.230.162.92:44334/v1"
+  base_url: ""
 
   # ── Token limits — two settings, easy to confuse ──────────────────────────
   #

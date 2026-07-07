@@ -40,7 +40,9 @@ services:
   # stdio — no docker-in-docker, no socket-proxy.
   tavily-adapter:
     image: ghcr.io/vakovalskii/searcharvester:latest
-    build: ./simple_tavily_adapter
+    build:
+      context: .
+      dockerfile: simple_tavily_adapter/Dockerfile
     container_name: tavily-adapter
     restart: unless-stopped
     networks:
@@ -65,8 +67,14 @@ services:
       - HERMES_UID=${HERMES_UID:-501}
       - HERMES_GID=${HERMES_GID:-20}
       # LLM credentials — pass-through from the invoking shell / .env.
+      # CUSTOM_BASE_URL is what Hermes actually reads for a self-hosted
+      # OpenAI-compatible backend (model.provider: "custom" in
+      # hermes-data/config.yaml) — OPENAI_BASE_URL is only consulted when
+      # the resolved endpoint is literally api.openai.com.
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - CUSTOM_BASE_URL=${CUSTOM_BASE_URL:-}
+      - HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}

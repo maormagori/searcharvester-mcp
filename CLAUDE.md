@@ -31,7 +31,7 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 | `simple_tavily_adapter/events.py` | Нормализатор ACP events → flat `Event{ts,job_id,agent_id,parent_id,type,payload}` |
 | `simple_tavily_adapter/tests/` | `test_events.py` (normalizer) + `test_research_api.py` (routes, моки) — 12 unit-тестов |
 | `hermes_skills/` | три наших skill'а в `agentskills.io` формате: search, extract, deep-research |
-| `hermes-data/` | **gitignored**, HERMES_HOME: config.yaml, SOUL.md, skills/ |
+| `hermes-data/` | HERMES_HOME. `SOUL.md` + `config.yaml` — **tracked, public, generic** (no deployment-specific values — `base_url` ships empty, filled at runtime from `CUSTOM_BASE_URL`). `skills/` — runtime-only, synced on boot, gitignored |
 | `jobs/` | **gitignored**, workspace каждой research-задачи (report.md, hermes.log, **events.jsonl**) |
 | `frontend/src/lib/api.ts` | `subscribeToJob()` → EventSource → типизированные `AgentEvent` |
 | `frontend/src/components/LogTimeline.tsx` | Рендер timeline из типизированных событий (без regex) |
@@ -43,7 +43,7 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 Поток:
 
 1. `POST /research {query}` → адаптер генерирует `job_id`, создаёт `jobs/{job_id}/`
-2. Оркестратор `asyncio.create_subprocess_exec("hermes", "acp", ...)` с `cwd=jobs/{id}` и env'ом из `.env.hermes` (OPENAI_API_KEY/BASE_URL, HERMES_HOME)
+2. Оркестратор `asyncio.create_subprocess_exec("hermes", "acp", ...)` с `cwd=jobs/{id}`, env = `{**os.environ, **self._env}` — то есть subprocess наследует весь env адаптера (заданный в `docker-compose.yaml`'s `environment:` из корневого `.env`), включая `CUSTOM_BASE_URL`/`OPENAI_API_KEY`/`HERMES_HOME`. Никакого отдельного `.env.hermes`-файла адаптер не читает.
 3. `acp.connect_to_agent(client, proc.stdin, proc.stdout)` → initialize → new_session → prompt
 4. Каждый `session_update` callback-ом пролетает через `events.normalize_acp_update()` → нормализованный `Event` → append в `job.events` + `asyncio.Condition.notify_all()`
 5. Клиент (UI или curl) подписан на `/research/{id}/events` (SSE) — `orchestrator.subscribe()` отдаёт replay + live stream через ту же Condition
@@ -56,7 +56,7 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 - **Flat Event schema** (`events.py`): `{ts, job_id, agent_id, parent_id, type, payload}`. `type` — union из `spawn|thought|message|tool_call|tool_result|plan|commands|note|done`. Транспорт-агностично — UI любого типа (React, curl -N, Python-клиент) потребляет одинаково. Если завтра уйдём с Hermes на Claude Code SDK, меняется только normalizer, не UI.
 - **events.jsonl** пишется on-the-fly в `jobs/{id}/events.jsonl` — post-mortem доступ без адаптера.
 - **cwd = job workspace**, без `/workspace` bind'а. Агент пишет в `./report.md`. `MANDATORY_SUFFIX` в `orchestrator.py` это говорит; SKILL.md тоже переведён на относительные пути.
-- **LLM-агностик**: `provider: "custom"` в `hermes-data/config.yaml` + `OPENAI_BASE_URL` + `OPENAI_API_KEY` (из `.env.hermes`, загружаемого `docker compose --env-file .env.hermes`). `provider: "vllm"` из доков на рантайме не принимается — используем "custom".
+- **LLM-агностик**: `provider: "custom"` зашит в `hermes-data/config.yaml` (`base_url` там **пустой** — файл публичный и генерик). Реальный бэкенд подставляется через env `CUSTOM_BASE_URL` + `OPENAI_API_KEY`, заданные в корневом `.env` и проброшенные `docker-compose.yaml`. ⚠ **`OPENAI_BASE_URL` больше не читается hermes-agent'ом для резолва endpoint'а** (проверено на `nousresearch/hermes-agent:latest`, `hermes_cli/runtime_provider.py`: "OPENAI_BASE_URL env var is no longer consulted — config.yaml is the single source of truth for endpoint URLs") — единственный env-путь для произвольного OpenAI-совместимого хоста это `CUSTOM_BASE_URL`. `provider: "vllm"` из доков на рантайме не принимается — используем "custom".
 
 ## Skills — три штуки
 
