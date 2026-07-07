@@ -174,6 +174,10 @@ def _build_orchestrator() -> Orchestrator | None:
         "GEMINI_API_KEY", "GOOGLE_API_KEY",
         "OLLAMA_API_KEY", "OLLAMA_BASE_URL",
         "NOUS_API_KEY", "HERMES_INFERENCE_PROVIDER",
+        # Overrides model.default from hermes-data/config.yaml without
+        # editing the tracked file — lets a deployment pick a model with
+        # more reliable tool-calling or a larger context window.
+        "HERMES_INFERENCE_MODEL",
     ]
     env = {k: os.environ[k] for k in pass_env_keys if k in os.environ}
 
@@ -894,11 +898,17 @@ if _research_enabled:
         timeout_sec: Annotated[int, Field(ge=60, le=1800, description="Max wait time in seconds (60–1800)")] = 900,
     ) -> dict[str, Any]:
         """Run a deep research job: searches multiple sources, extracts content, and returns a full cited markdown report. This is slow (minutes). Use for thorough research questions, not quick lookups. Requires the research orchestrator (hermes) to be running."""
+        if orchestrator is None:
+            raise RuntimeError("Research unavailable: hermes binary not found on PATH.")
         job_id = await orchestrator.spawn(query=query)
         logger.info("MCP research job %s started for query: %r", job_id, query)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout_sec
-        terminal = {JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
+        # `degraded` = the agent replied without ever writing report.md (e.g.
+        # plain chat text instead of running the research flow). Treated as
+        # a hard failure here so a calling LLM doesn't mistake filler text
+        # for a cited report.
+        terminal = {JobStatus.failed, JobStatus.timeout, JobStatus.cancelled, JobStatus.degraded}
         while loop.time() < deadline:
             await asyncio.sleep(5)
             job = orchestrator.get(job_id)

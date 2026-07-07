@@ -122,6 +122,25 @@ async def test_research_completes_and_returns_report(monkeypatch):
     assert out["report"] == "# Report"
 
 
+async def test_research_degraded_raises_instead_of_returning_chatter(monkeypatch):
+    """A job that ends `degraded` (no report.md — agent replied with plain
+    chat text) must NOT look like a successful, cited-report response to
+    a calling LLM — it must raise loudly instead."""
+    mock_orch = MagicMock()
+    mock_orch.spawn = AsyncMock(return_value="job-456")
+    degraded_job = Job(
+        id="job-456", query="test", status=JobStatus.degraded,
+        report="What would you like me to work on?",
+        error="no report.md — agent replied with plain chat text instead of "
+              "invoking the research flow (no tool calls observed)",
+    )
+    mock_orch.get = MagicMock(return_value=degraded_job)
+    monkeypatch.setattr(main, "orchestrator", mock_orch)
+
+    with pytest.raises(RuntimeError, match="degraded"):
+        await searcharvester_research(query="test", timeout_sec=60)
+
+
 # ---------- searcharvester_search: engines param ----------
 
 async def test_search_engines_passed_through(monkeypatch):

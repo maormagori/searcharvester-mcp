@@ -105,7 +105,7 @@ curl -s -X POST http://localhost:8000/mcp/ \
 Старые `test_orchestrator.py` (FakeDockerClient) удалены — оркестратор больше не использует docker-py. Реальное покрытие "ACP subprocess → events" сейчас даёт E2E (или Playwright smoke через UI).
 
 ```bash
-docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 21 passed за ~2с
+docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 46 passed, 1 skipped (e2e) за ~12с
 # (pytest не в PATH как алиас — идёт через venv-python)
 ```
 
@@ -119,6 +119,7 @@ docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 
 - **Изоляция agent ↔ adapter**: теперь в одном контейнере. Hermes `--yolo` terminal-команды выполняются в адаптерном user space. По сравнению с v2.1 (отдельный контейнер) — даунгрейд изоляции. Критично если кто-то скормит промпт с `rm -rf /app/…`. Пока ок для dev.
 - **`Caddyfile` не подключён** к compose — если нужен HTTPS, добавь сервис вручную.
 - **`limiter: false`** в `config.yaml` — SearXNG без анти-бот защиты. Ок для локалки, не ок для публичного endpoint'а.
+- **Надёжность tool-calling у `/research` зависит от бэкенда/модели.** `hermes acp` всегда получает фиксированный toolset `hermes-acp` (включает `delegate_task`, `web_search`/`web_extract`, `write_file` — см. `toolsets.py` в образе `nousresearch/hermes-agent`), но не любая OpenAI-совместимая модель надёжно эмитит tool calls через ACP wire-протокол. Симптом: агент отвечает обычным чатом ("What would you like me to work on?") вместо `delegate_task`. `orchestrator.py::_finalize_success` это детектит: если `report.md` не появился, но были сообщения — статус `degraded` (не `completed`), с диагностикой "no tool calls observed" vs "ran some tools but no report". MCP-тул `searcharvester_research` на `degraded` кидает `RuntimeError`, так что вызывающий агент не спутает болтовню с cited-отчётом. Модель для `/research` настраивается через env `HERMES_INFERENCE_MODEL` (проброшен в `docker-compose.yaml` и `main.py::pass_env_keys`) — так деплой может подобрать модель понадёжнее, не трогая трекнутый `hermes-data/config.yaml`.
 
 ## Git
 

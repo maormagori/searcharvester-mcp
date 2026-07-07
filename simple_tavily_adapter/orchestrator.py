@@ -56,6 +56,11 @@ two-round pipeline:
            researchers' findings handed in as context
 Then you (the lead) synthesise a cited report.
 
+YOUR FIRST MESSAGE IN THIS CONVERSATION MUST BE A `delegate_task` TOOL
+CALL. Do not reply with plain acknowledgement text, a restatement of
+the question, or a clarifying question first — call the tool
+immediately.
+
 Do NOT try to answer the question yourself between rounds; your only
 job is to read each round's JSON, decide what context the next round
 needs, and fire the next delegate_task.
@@ -77,10 +82,23 @@ Output: `./report.md` (relative path), following the skill's format."""
 MANDATORY_SUFFIX = _mandatory_suffix()
 
 
+def _build_prompt(query: str, skills: list[str]) -> str:
+    """Wrap the raw user query with the skill hint + mandatory research
+    directive. Pulled out to a pure function so the prompt contract is
+    testable without spawning a subprocess."""
+    skills_hint = ", ".join(skills)
+    return (
+        f"Use these skills: {skills_hint}.\n\n"
+        f"{query}"
+        f"{_mandatory_suffix()}"
+    )
+
+
 class JobStatus(str, Enum):
     queued = "queued"
     running = "running"
     completed = "completed"
+    degraded = "degraded"  # finished, but no report.md — fell back to raw chat text
     failed = "failed"
     timeout = "timeout"
     cancelled = "cancelled"
@@ -365,18 +383,12 @@ class Orchestrator:
             )
             session = await conn.new_session(mcp_servers=[], cwd=str(job.workspace_path))
 
-            # Preload skills via slash-command prompt prefix — `hermes acp` honours
-            # the same `--skills` contract through the /skills slash command.
-            # Simpler: shove skills load into the query text itself (agent reads
-            # SKILL.md when it sees the name). That matches chat-mode behaviour.
-            skills_hint = ", ".join(self._skills)
-            # Build suffix per-call so the current-date hint stays fresh
-            # even on long-running containers.
-            wrapped = (
-                f"Use these skills: {skills_hint}.\n\n"
-                f"{query}"
-                f"{_mandatory_suffix()}"
-            )
+            # `hermes acp` has no `--skills`/`--toolsets` flags (unlike `hermes
+            # chat`) — the ACP session always gets the fixed "hermes-acp"
+            # toolset (includes delegate_task, web_search/extract, skills_*).
+            # Skill activation instead goes through the prompt text itself,
+            # naming the skill so the model calls skill_view on it.
+            wrapped = _build_prompt(query, self._skills)
 
             prompt_task = asyncio.create_task(
                 conn.prompt(
@@ -657,13 +669,27 @@ class Orchestrator:
         ]
         fallback = "".join(msg_chunks).strip()
         if fallback:
+            # Distinguish "never even tried the research flow" (no tool_call
+            # from the lead at all — a plain chat reply) from "ran some
+            # tools but never wrote report.md" — both are non-answers, but
+            # the former usually means the backend/model isn't reliably
+            # emitting tool calls at all (see e.g. streaming/parse issues
+            # with some local OpenAI-compatible backends).
+            used_any_tool = any(
+                e.type == "tool_call" and e.agent_id == "lead" for e in job.events
+            )
             job.report = fallback
-            job.error = "no report.md — using assistant message"
+            job.error = (
+                "no report.md — agent replied with plain chat text instead of "
+                "invoking the research flow (no tool calls observed)"
+                if not used_any_tool else
+                "no report.md — falling back to the agent's final chat message"
+            )
             await self._emit(job, Event.now(
                 job_id=job.id, agent_id="lead", type="done",
-                payload={"status": "completed", "note": job.error},
+                payload={"status": "degraded", "note": job.error},
             ))
-            job.status = JobStatus.completed
+            job.status = JobStatus.degraded
             await self._notify(job)
             return
 

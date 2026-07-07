@@ -75,6 +75,11 @@ services:
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
       - CUSTOM_BASE_URL=${CUSTOM_BASE_URL:-}
       - HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER:-}
+      # Overrides model.default from hermes-data/config.yaml at runtime —
+      # set this instead of editing the tracked config when a deployment
+      # needs a different model (e.g. more context, more reliable
+      # tool-calling on its backend).
+      - HERMES_INFERENCE_MODEL=${HERMES_INFERENCE_MODEL:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
