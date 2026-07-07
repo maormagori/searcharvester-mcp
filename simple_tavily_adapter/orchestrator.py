@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -123,6 +124,200 @@ class Job:
     _process: Any = None  # asyncio.subprocess.Process | None
 
 
+class DirectResearchFallback:
+    """Runs search, extract, then an OpenAI-compatible synthesis call."""
+
+    def __init__(
+        self,
+        *,
+        search_func: Any,
+        extract_func: Any,
+        complete_func: Any | None = None,
+        get_http_session: Any | None = None,
+        max_results: int | None = None,
+        max_extracts: int | None = None,
+    ) -> None:
+        self._search_func = search_func
+        self._extract_func = extract_func
+        self._complete_func = complete_func
+        self._get_http_session = get_http_session
+        self._max_results = max_results or int(os.environ.get("RESEARCH_FALLBACK_MAX_RESULTS", "8"))
+        self._max_extracts = max_extracts or int(os.environ.get("RESEARCH_FALLBACK_MAX_EXTRACTS", "5"))
+
+    async def run(self, *, query: str, workspace_path: Path, lead_text: str) -> str:
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        results = await self._search_func(
+            query=query,
+            max_results=self._max_results,
+            include_raw_content=False,
+            engines=None,
+            categories="general",
+        )
+        sources = await self._extract_sources(results)
+        if not sources:
+            raise RuntimeError("direct fallback found no extractable sources")
+
+        messages = self._build_messages(query=query, sources=sources, lead_text=lead_text)
+        report = await self._complete(messages)
+        report = self._ensure_cited_report(query=query, report=report, sources=sources)
+        (workspace_path / REPORT_FILENAME).write_text(report, encoding="utf-8")
+        return report
+
+    async def _extract_sources(self, results: list[Any]) -> list[dict[str, str]]:
+        sources: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for result in results:
+            if len(sources) >= self._max_extracts:
+                break
+            url = getattr(result, "url", "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            try:
+                title, content = await self._extract_func(url)
+            except Exception as exc:
+                logger.info("direct research fallback skipped %s: %s", url, exc)
+                content = getattr(result, "raw_content", None) or getattr(result, "content", "")
+                title = getattr(result, "title", "")
+            if not content:
+                continue
+            sources.append({
+                "n": str(len(sources) + 1),
+                "url": url,
+                "title": title or getattr(result, "title", "") or url,
+                "snippet": getattr(result, "content", "") or "",
+                "content": content[:6000],
+            })
+        return sources
+
+    def _build_messages(
+        self, *, query: str, sources: list[dict[str, str]], lead_text: str
+    ) -> list[dict[str, str]]:
+        source_blocks = []
+        for source in sources:
+            source_blocks.append(
+                "\n".join([
+                    f"[{source['n']}] {source['title']}",
+                    f"URL: {source['url']}",
+                    f"Search snippet: {source['snippet']}",
+                    "Extract:",
+                    source["content"],
+                ])
+            )
+        lead_note = f"\n\nHermes lead text that triggered fallback:\n{lead_text}" if lead_text else ""
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You write concise markdown research reports from supplied web extracts. "
+                    "Use only the numbered sources in the prompt. Cite factual claims with "
+                    "inline [n] citations and include a References section."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Research question:\n{query}\n\n"
+                    "Write a sourced markdown report. Requirements:\n"
+                    "- Start with a title.\n"
+                    "- Include a short TL;DR.\n"
+                    "- Cite claims using the supplied source numbers like [1].\n"
+                    "- End with ## References using the exact URLs below.\n"
+                    f"{lead_note}\n\n"
+                    "Sources:\n\n"
+                    + "\n\n---\n\n".join(source_blocks)
+                ),
+            },
+        ]
+
+    async def _complete(self, messages: list[dict[str, str]]) -> str:
+        if self._complete_func is not None:
+            return await self._complete_func(messages)
+
+        base_url = (
+            os.environ.get("RESEARCH_FALLBACK_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("CUSTOM_BASE_URL")
+        )
+        model = os.environ.get("RESEARCH_FALLBACK_MODEL") or os.environ.get("HERMES_INFERENCE_MODEL")
+        if not base_url or not model:
+            raise RuntimeError("direct fallback model is not configured")
+
+        endpoint = base_url.rstrip("/")
+        if not endpoint.endswith("/chat/completions"):
+            endpoint = f"{endpoint}/chat/completions"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OLLAMA_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": float(os.environ.get("RESEARCH_FALLBACK_TEMPERATURE", "0.2")),
+            "max_tokens": int(os.environ.get("RESEARCH_FALLBACK_MAX_TOKENS", "4096")),
+        }
+
+        async def _post(session: Any) -> str:
+            import aiohttp
+
+            async with session.post(
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(
+                    total=int(os.environ.get("RESEARCH_FALLBACK_TIMEOUT_SEC", "180"))
+                ),
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"direct fallback model request failed with HTTP {response.status}")
+                data = await response.json(content_type=None)
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError("direct fallback model response did not contain message content") from exc
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("direct fallback model returned empty content")
+            return content.strip()
+
+        session = self._get_http_session() if self._get_http_session else None
+        if session is not None:
+            return await _post(session)
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as temp_session:
+            return await _post(temp_session)
+
+    def _ensure_cited_report(
+        self, *, query: str, report: str, sources: list[dict[str, str]]
+    ) -> str:
+        report = report.strip()
+        if not re.search(r"\[\d+\]", report):
+            source_lines = [
+                f"- {source['title']}: {source['snippet'] or source['content'][:240]} [{source['n']}]"
+                for source in sources
+            ]
+            report = (
+                f"# Research report: {query}\n\n"
+                "## TL;DR\n"
+                "The fallback model did not return inline citations, so this report lists the sourced evidence directly.\n\n"
+                "## Sources reviewed\n"
+                + "\n".join(source_lines)
+            )
+        if "## References" not in report:
+            report += "\n\n## References"
+        existing = set(re.findall(r"https?://[^\s)\\]\"'<>]+", report))
+        reference_lines = []
+        for source in sources:
+            if source["url"] not in existing:
+                reference_lines.append(f"[{source['n']}] {source['title']} - {source['url']}")
+        if reference_lines:
+            report += "\n" + "\n".join(reference_lines)
+        return report.rstrip() + "\n"
+
+
 class Orchestrator:
     """Spawns + watches `hermes acp` sessions per research job."""
 
@@ -136,6 +331,7 @@ class Orchestrator:
         adapter_url_for_hermes: str = "http://localhost:8000",
         timeout_sec: int = 600,
         hermes_home: str | None = None,
+        research_fallback: Any | None = None,
     ) -> None:
         """
         hermes_bin: path to `hermes` executable (must be in $PATH of this process).
@@ -154,6 +350,7 @@ class Orchestrator:
         self._adapter_url = adapter_url_for_hermes
         self._timeout = timeout_sec
         self._hermes_home = hermes_home or os.environ.get("HERMES_HOME", "/opt/data")
+        self._research_fallback = research_fallback
         self._jobs: dict[str, Job] = {}
         self._lock = asyncio.Lock()
 
@@ -226,7 +423,7 @@ class Orchestrator:
         idx = 0
         terminal = {
             JobStatus.completed, JobStatus.failed,
-            JobStatus.timeout, JobStatus.cancelled,
+            JobStatus.timeout, JobStatus.cancelled, JobStatus.degraded,
         }
         while True:
             # Snapshot under lock-free copy; events list only grows.
@@ -668,6 +865,32 @@ class Orchestrator:
             if e.type == "message" and isinstance(e.payload.get("text"), str)
         ]
         fallback = "".join(msg_chunks).strip()
+        if self._research_fallback is not None:
+            try:
+                if job.workspace_path is None:
+                    raise RuntimeError("job has no workspace path")
+                report = await self._research_fallback.run(
+                    query=job.query,
+                    workspace_path=job.workspace_path,
+                    lead_text=fallback,
+                )
+                report_path.write_text(report, encoding="utf-8")
+                job.report = report
+                job.error = None
+                await self._emit(job, Event.now(
+                    job_id=job.id, agent_id="lead", type="done",
+                    payload={
+                        "status": "completed",
+                        "report_bytes": len(job.report),
+                        "fallback": "direct",
+                    },
+                ))
+                job.status = JobStatus.completed
+                await self._notify(job)
+                return
+            except Exception as exc:
+                logger.warning("direct research fallback failed for %s: %s", job.id, exc)
+
         if fallback:
             # Distinguish "never even tried the research flow" (no tool_call
             # from the lead at all — a plain chat reply) from "ran some
@@ -984,5 +1207,3 @@ def _goal_for_task_index(
             if isinstance(task, dict):
                 return str(task.get("goal") or "")
     return ""
-
-

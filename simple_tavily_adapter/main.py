@@ -38,7 +38,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tavily_client import TavilyResponse, TavilyResult
 from config_loader import config
-from orchestrator import Orchestrator, Job, JobStatus
+from orchestrator import DirectResearchFallback, Orchestrator, Job, JobStatus
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -152,8 +152,6 @@ app.add_middleware(
 )
 
 
-# ---------- Orchestrator singleton ----------
-
 def _build_orchestrator() -> Orchestrator | None:
     """Build Orchestrator. v2.2+ runs `hermes acp` as a subprocess in the same
     container, so there's no Docker-daemon prereq. Returns None only if the
@@ -195,14 +193,12 @@ def _build_orchestrator() -> Orchestrator | None:
         ),
         timeout_sec=int(os.environ.get("RESEARCH_TIMEOUT_SEC", "900")),
         hermes_home=os.environ.get("HERMES_HOME", "/opt/data"),
+        research_fallback=DirectResearchFallback(
+            search_func=_execute_search,
+            extract_func=_extract_markdown_for_url,
+            get_http_session=lambda: _http_session,
+        ),
     )
-
-
-orchestrator: Orchestrator | None = _build_orchestrator()
-
-_research_enabled = orchestrator is not None and _llm_configured
-if not _research_enabled:
-    logger.info("Research tool disabled: no LLM credentials configured")
 
 
 
@@ -553,6 +549,13 @@ async def extract_page(
 
 
 # ---------- /research ----------
+
+orchestrator: Orchestrator | None = _build_orchestrator()
+
+_research_enabled = orchestrator is not None and _llm_configured
+if not _research_enabled:
+    logger.info("Research tool disabled: no LLM credentials configured")
+
 
 class ResearchRequest(BaseModel):
     query: constr(min_length=1, max_length=2000)  # type: ignore[valid-type]
