@@ -293,14 +293,15 @@ class DirectResearchFallback:
         self, *, query: str, report: str, sources: list[dict[str, str]]
     ) -> str:
         report = report.strip()
+        reference_sources = sources
         if not re.search(r"\[\d+\]", report):
-            report = self._synthesise_from_sources(query=query, sources=sources)
+            report, reference_sources = self._synthesise_from_sources(query=query, sources=sources)
         if "## References" not in report:
             report += "\n\n## References"
         existing = set(re.findall(r"https?://[^\s)\\]\"'<>]+", report))
         cited_numbers = set(re.findall(r"\[(\d+)\]", report))
         reference_lines = []
-        for source in sources:
+        for source in reference_sources:
             if cited_numbers and source["n"] not in cited_numbers:
                 continue
             if source["url"] not in existing:
@@ -311,18 +312,24 @@ class DirectResearchFallback:
 
     def _synthesise_from_sources(
         self, *, query: str, sources: list[dict[str, str]]
-    ) -> str:
+    ) -> tuple[str, list[dict[str, str]]]:
         limit = _requested_word_limit(query)
         source_limit = _requested_source_limit(query)
+        subject = _query_subject(query)
         target = limit if limit is not None else 220
-        usable_sources = sources[:source_limit] if source_limit is not None else sources
+        ranked_sources = _rank_sources_for_query(sources, subject)
+        selected_sources = ranked_sources[:source_limit] if source_limit is not None else ranked_sources
+        usable_sources = [
+            {**source, "n": str(index + 1)}
+            for index, source in enumerate(selected_sources)
+        ]
         references_overhead = _reference_word_count(usable_sources)
         body_budget = max(30, target - references_overhead)
 
         bullets: list[str] = []
         used_words = _word_count("# Research report\n\n## TL;DR\n")
         for source in usable_sources:
-            sentence = _best_source_sentence(source)
+            sentence = _best_source_sentence(source, subject)
             if not sentence:
                 continue
             bullet = f"- {sentence} [{source['n']}]"
@@ -341,7 +348,7 @@ class DirectResearchFallback:
         if limit is not None and limit <= 100 and len(bullets) > 2:
             bullets = bullets[:2]
 
-        return "# Research report\n\n## TL;DR\n" + "\n".join(bullets)
+        return "# Research report\n\n## TL;DR\n" + "\n".join(bullets), usable_sources
 
 
 class Orchestrator:
@@ -1116,16 +1123,122 @@ def _reference_word_count(sources: list[dict[str, str]]) -> int:
     return sum(_word_count(f"[{source['n']}] {source['title']} - {source['url']}") for source in sources)
 
 
-def _best_source_sentence(source: dict[str, str]) -> str:
-    text = source.get("snippet") or source.get("content") or source.get("title") or ""
+def _rank_sources_for_query(sources: list[dict[str, str]], subject: str) -> list[dict[str, str]]:
+    return sorted(
+        sources,
+        key=lambda source: _source_score(source, subject),
+        reverse=True,
+    )
+
+
+def _source_score(source: dict[str, str], subject: str) -> int:
+    text = " ".join([
+        source.get("title", ""),
+        source.get("snippet", ""),
+        source.get("content", "")[:1000],
+    ]).lower()
+    url = source.get("url", "").lower()
+    host = _url_host(url)
+    subject_terms = _subject_terms(subject)
+
+    score = 0
+    if subject_terms and all(term in text for term in subject_terms):
+        score += 8
+    if subject_terms and any(term in host for term in subject_terms):
+        score += 8
+    if host.startswith("docs.") or ".docs." in host or "/docs/" in url:
+        score += 6
+    if any(part in host for part in ("developer.", "reference.", "learn.")):
+        score += 3
+    if _best_source_sentence(source, subject):
+        score += 5
+    return score
+
+
+def _url_host(url: str) -> str:
+    match = re.match(r"https?://([^/]+)", url)
+    return match.group(1).lower() if match else ""
+
+
+def _query_subject(query: str) -> str:
+    first = query.split(".", 1)[0]
+    first = re.sub(r"^\s*(?:research|explain|summarize|summarise|define)\s+", "", first, flags=re.I)
+    patterns = [
+        r"\bwhat\s+is\s+(.+)$",
+        r"\bwhat\s+(.+?)\s+is\b",
+        r"\bdefine\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, first, re.I)
+        if match:
+            return _clean_subject(match.group(1))
+    return _clean_subject(first)
+
+
+def _clean_subject(text: str) -> str:
+    text = re.sub(r"\b(?:please|briefly|quickly)\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ?!,:;-")
+
+
+def _subject_terms(subject: str) -> list[str]:
+    stop = {"a", "an", "and", "are", "for", "how", "is", "of", "the", "to", "what"}
+    return [
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]+", subject)
+        if term.lower() not in stop
+    ]
+
+
+def _best_source_sentence(source: dict[str, str], subject: str = "") -> str:
+    text = " ".join([
+        source.get("snippet", ""),
+        source.get("content", ""),
+        source.get("title", ""),
+    ])
     text = _clean_source_text(text)
-    for sentence in _split_sentences(text):
-        if 6 <= _word_count(sentence) <= 35:
+    sentences = [
+        sentence for sentence in _split_sentences(text)
+        if 6 <= _word_count(sentence) <= 35
+    ]
+    if not sentences:
+        sentences = _split_sentences(text)
+    ranked = sorted(
+        sentences,
+        key=lambda sentence: _sentence_score(sentence, subject),
+        reverse=True,
+    )
+    for sentence in ranked:
+        if sentence:
             return sentence
     words = text.split()
     if not words:
         return ""
     return " ".join(words[:28]).rstrip(".,;:") + "."
+
+
+def _sentence_score(sentence: str, subject: str) -> int:
+    lower = sentence.lower()
+    terms = _subject_terms(subject)
+    score = 0
+    if terms and all(term in lower for term in terms):
+        score += 10
+    elif terms and any(term in lower for term in terms):
+        score += 4
+    definition_patterns = [
+        r"\bis\s+(?:a|an|the)\b",
+        r"\bis\s+used\s+to\b",
+        r"\blets\s+you\b",
+        r"\ballows\s+you\s+to\b",
+        r"\bhelps\s+you\b",
+        r"\bfor\s+defining\b",
+        r"\bfor\s+running\b",
+    ]
+    if any(re.search(pattern, lower) for pattern in definition_patterns):
+        score += 8
+    if re.search(r"\b(?:configure|credentials|environment variables?)\b", lower):
+        score -= 4
+    return score
 
 
 def _clean_source_text(text: str) -> str:

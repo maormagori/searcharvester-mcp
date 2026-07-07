@@ -239,6 +239,74 @@ async def test_direct_research_fallback_repairs_uncited_model_output_with_synthe
     assert len(report.split()) <= 100
 
 
+async def test_direct_research_fallback_prefers_official_definition_source(tmp_path):
+    async def search_func(*, query, max_results, include_raw_content, engines, categories):
+        return [
+            SearchResult(
+                url="https://spacelift.io/blog/docker-compose",
+                title="Docker Compose - What is It, Example & Tutorial",
+                content=(
+                    "Environment variables are set to configure the MySQL "
+                    "instance and supply credentials to the WordPress container."
+                ),
+            ),
+            SearchResult(
+                url="https://docs.docker.com/compose/",
+                title="Docker Compose overview",
+                content=(
+                    "Docker Compose is a tool for defining and running "
+                    "multi-container applications."
+                ),
+            ),
+        ]
+
+    async def extract_func(url):
+        if "spacelift.io" in url:
+            return (
+                "Docker Compose - What is It, Example & Tutorial",
+                (
+                    "Environment variables are set to configure the MySQL "
+                    "instance and supply credentials to the WordPress container. "
+                    "This tutorial shows a WordPress example."
+                ),
+            )
+        return (
+            "Docker Compose overview",
+            (
+                "Docker Compose is a tool for defining and running "
+                "multi-container applications. Compose lets you define app "
+                "services in a YAML file and run them together."
+            ),
+        )
+
+    async def complete_func(messages):
+        return "Docker Compose helps run containers."
+
+    fallback = DirectResearchFallback(
+        search_func=search_func,
+        extract_func=extract_func,
+        complete_func=complete_func,
+        max_results=2,
+        max_extracts=2,
+    )
+
+    report = await fallback.run(
+        query=(
+            "Research what Docker Compose is. Use one web source. "
+            "Keep the final answer under 100 words."
+        ),
+        workspace_path=tmp_path,
+        lead_text="",
+    )
+
+    assert "Docker Compose is a tool" in report
+    assert "[1]" in report
+    assert "[2]" not in report
+    assert "Environment variables are set" not in report
+    assert "https://docs.docker.com/compose/" in report
+    assert "https://spacelift.io/blog/docker-compose" not in report
+
+
 async def test_finalize_degraded_notes_partial_tool_use(tmp_path):
     orch = _make_orchestrator(tmp_path)
     job = _make_job(tmp_path)
