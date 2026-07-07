@@ -204,7 +204,6 @@ class DirectResearchFallback:
                     source["content"],
                 ])
             )
-        lead_note = f"\n\nHermes lead text that triggered fallback:\n{lead_text}" if lead_text else ""
         return [
             {
                 "role": "system",
@@ -223,7 +222,7 @@ class DirectResearchFallback:
                     "- Include a short TL;DR.\n"
                     "- Cite claims using the supplied source numbers like [1].\n"
                     "- End with ## References using the exact URLs below.\n"
-                    f"{lead_note}\n\n"
+                    "\n"
                     "Sources:\n\n"
                     + "\n\n---\n\n".join(source_blocks)
                 ),
@@ -295,27 +294,54 @@ class DirectResearchFallback:
     ) -> str:
         report = report.strip()
         if not re.search(r"\[\d+\]", report):
-            source_lines = [
-                f"- {source['title']}: {source['snippet'] or source['content'][:240]} [{source['n']}]"
-                for source in sources
-            ]
-            report = (
-                f"# Research report: {query}\n\n"
-                "## TL;DR\n"
-                "The fallback model did not return inline citations, so this report lists the sourced evidence directly.\n\n"
-                "## Sources reviewed\n"
-                + "\n".join(source_lines)
-            )
+            report = self._synthesise_from_sources(query=query, sources=sources)
         if "## References" not in report:
             report += "\n\n## References"
         existing = set(re.findall(r"https?://[^\s)\\]\"'<>]+", report))
+        cited_numbers = set(re.findall(r"\[(\d+)\]", report))
         reference_lines = []
         for source in sources:
+            if cited_numbers and source["n"] not in cited_numbers:
+                continue
             if source["url"] not in existing:
                 reference_lines.append(f"[{source['n']}] {source['title']} - {source['url']}")
         if reference_lines:
             report += "\n" + "\n".join(reference_lines)
         return report.rstrip() + "\n"
+
+    def _synthesise_from_sources(
+        self, *, query: str, sources: list[dict[str, str]]
+    ) -> str:
+        limit = _requested_word_limit(query)
+        source_limit = _requested_source_limit(query)
+        target = limit if limit is not None else 220
+        usable_sources = sources[:source_limit] if source_limit is not None else sources
+        references_overhead = _reference_word_count(usable_sources)
+        body_budget = max(30, target - references_overhead)
+
+        bullets: list[str] = []
+        used_words = _word_count("# Research report\n\n## TL;DR\n")
+        for source in usable_sources:
+            sentence = _best_source_sentence(source)
+            if not sentence:
+                continue
+            bullet = f"- {sentence} [{source['n']}]"
+            next_words = used_words + _word_count(bullet)
+            if bullets and next_words > body_budget:
+                break
+            bullets.append(bullet)
+            used_words = next_words
+            if len(bullets) >= 4:
+                break
+
+        if not bullets:
+            first = usable_sources[0]
+            bullets = [f"- {first['title']} is a relevant source for this question. [{first['n']}]"]
+
+        if limit is not None and limit <= 100 and len(bullets) > 2:
+            bullets = bullets[:2]
+
+        return "# Research report\n\n## TL;DR\n" + "\n".join(bullets)
 
 
 class Orchestrator:
@@ -882,7 +908,7 @@ class Orchestrator:
                     payload={
                         "status": "completed",
                         "report_bytes": len(job.report),
-                        "fallback": "direct",
+                        "research_path": "direct",
                     },
                 ))
                 job.status = JobStatus.completed
@@ -1064,6 +1090,55 @@ def _verify_urls_against_extracts(
         else:
             missing.append(url)
     return (verified, missing)
+
+
+def _requested_word_limit(query: str) -> int | None:
+    match = re.search(r"\b(?:under|less than|fewer than|within|max(?:imum)?)\s+(\d+)\s+words?\b", query, re.I)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _requested_source_limit(query: str) -> int | None:
+    match = re.search(r"\b(?:use|with|from)\s+(one|two|three|four|\d+)\s+(?:web\s+)?sources?\b", query, re.I)
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    names = {"one": 1, "two": 2, "three": 3, "four": 4}
+    return names.get(raw, int(raw) if raw.isdigit() else 1)
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text))
+
+
+def _reference_word_count(sources: list[dict[str, str]]) -> int:
+    return sum(_word_count(f"[{source['n']}] {source['title']} - {source['url']}") for source in sources)
+
+
+def _best_source_sentence(source: dict[str, str]) -> str:
+    text = source.get("snippet") or source.get("content") or source.get("title") or ""
+    text = _clean_source_text(text)
+    for sentence in _split_sentences(text):
+        if 6 <= _word_count(sentence) <= 35:
+            return sentence
+    words = text.split()
+    if not words:
+        return ""
+    return " ".join(words[:28]).rstrip(".,;:") + "."
+
+
+def _clean_source_text(text: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[#*_`>|]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[.!?])\s+", text)
+    return [piece.strip(" -") for piece in pieces if piece.strip(" -")]
 
 
 def _index_sub_sessions(

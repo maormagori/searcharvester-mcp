@@ -142,6 +142,8 @@ async def test_direct_research_fallback_uses_search_extract_and_model(tmp_path):
     async def complete_func(messages):
         calls.append(("complete", messages))
         assert "https://example.com/alpha" in messages[-1]["content"]
+        assert "fallback" not in messages[-1]["content"].lower()
+        assert "tool-shaped" not in messages[-1]["content"].lower()
         return (
             "# Example report\n\n"
             "Alpha and beta are both relevant [1][2].\n\n"
@@ -158,12 +160,83 @@ async def test_direct_research_fallback_uses_search_extract_and_model(tmp_path):
         max_extracts=2,
     )
 
-    report = await fallback.run(query="research alpha beta", workspace_path=tmp_path, lead_text="")
+    report = await fallback.run(
+        query="research alpha beta",
+        workspace_path=tmp_path,
+        lead_text='{"name":"searcharvester-deep-research"}',
+    )
 
     assert report.startswith("# Example report")
     assert "[1] Alpha source" in report
     assert (tmp_path / "report.md").read_text() == report
     assert [call[0] for call in calls] == ["search", "extract", "extract", "complete"]
+
+
+async def test_direct_research_fallback_repairs_uncited_model_output_with_synthesis(tmp_path):
+    async def search_func(*, query, max_results, include_raw_content, engines, categories):
+        return [
+            SearchResult(
+                url="https://docs.docker.com/compose/",
+                title="Docker Compose overview",
+                content=(
+                    "Docker Compose is a tool for defining and running "
+                    "multi-container applications."
+                ),
+            ),
+            SearchResult(
+                url="https://docs.docker.com/reference/compose-file/",
+                title="Compose file reference",
+                content=(
+                    "The Compose file is a YAML file defining services, "
+                    "networks, volumes, configs and secrets."
+                ),
+            ),
+        ]
+
+    async def extract_func(url):
+        if url.endswith("/compose/"):
+            return (
+                "Docker Compose overview",
+                (
+                    "Docker Compose is a tool for defining and running "
+                    "multi-container applications. Compose simplifies the "
+                    "control of your entire application stack."
+                ),
+            )
+        return (
+            "Compose file reference",
+            (
+                "The Compose file is a YAML file defining services, networks, "
+                "volumes, configs and secrets."
+            ),
+        )
+
+    async def complete_func(messages):
+        return "Docker Compose lets you run app stacks from a YAML file."
+
+    fallback = DirectResearchFallback(
+        search_func=search_func,
+        extract_func=extract_func,
+        complete_func=complete_func,
+        max_results=2,
+        max_extracts=2,
+    )
+
+    report = await fallback.run(
+        query=(
+            "Research what Docker Compose is. Use one web source. "
+            "Keep the final answer under 100 words."
+        ),
+        workspace_path=tmp_path,
+        lead_text="",
+    )
+
+    assert "fallback model did not return inline citations" not in report
+    assert "Docker Compose is a tool" in report
+    assert "[1]" in report
+    assert "https://docs.docker.com/compose/" in report
+    assert "https://docs.docker.com/reference/compose-file/" not in report
+    assert len(report.split()) <= 100
 
 
 async def test_finalize_degraded_notes_partial_tool_use(tmp_path):
