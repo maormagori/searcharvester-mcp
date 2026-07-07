@@ -295,7 +295,14 @@ class DirectResearchFallback:
         report = report.strip()
         reference_sources = sources
         if not re.search(r"\[\d+\]", report):
-            report, reference_sources = self._synthesise_from_sources(query=query, sources=sources)
+            # Previously silently substituted a non-LLM mechanical sentence-
+            # scraper (_synthesise_from_sources) here, which could surface
+            # raw, uncleaned extracted text as if it were a completed report.
+            # Raise instead so the caller's existing degraded-status handling
+            # takes over, rather than presenting a non-LLM stub as `completed`.
+            raise RuntimeError(
+                "direct fallback model produced no [n]-style citations in its report"
+            )
         if "## References" not in report:
             report += "\n\n## References"
         existing = set(re.findall(r"https?://[^\s)\\]\"'<>]+", report))
