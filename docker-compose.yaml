@@ -80,6 +80,13 @@ services:
       # needs a different model (e.g. more context, more reliable
       # tool-calling on its backend).
       - HERMES_INFERENCE_MODEL=${HERMES_INFERENCE_MODEL:-}
+      # Set to "false" to skip spawning `hermes acp` entirely and go
+      # straight to the direct search+extract+RESEARCH_FALLBACK_MODEL path
+      # for every /research job. Use when HERMES_INFERENCE_MODEL doesn't
+      # reliably emit real ACP tool calls (see CLAUDE.md "Известные
+      # шероховатости") — avoids paying for a doomed subprocess + model
+      # load on every call. Defaults to "true".
+      - SEARCHARVESTER_ACP_ENABLED=${SEARCHARVESTER_ACP_ENABLED:-true}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}

@@ -84,6 +84,31 @@ The `/extract` in-memory cache lives in the `tavily-adapter` process and is wipe
 
 If this bothers you — see CLAUDE.md. A persistent cache (SQLite / Redis) is intentionally not implemented to keep things simple.
 
+### `/research` always ends up `degraded` with "no tool calls observed"
+
+This means `hermes acp` is running but the configured `HERMES_INFERENCE_MODEL`
+never emits a real ACP tool call — it replies with plain chat text instead
+(sometimes text that *looks* like a tool call, but the ACP wire protocol
+never sees one). Confirmed on a self-hosted Ollama backend with
+`gpt-oss:20b`: the lead session file shows only assistant chat content, no
+populated `tool_calls`.
+
+Until you have a backend/model that reliably emits ACP tool calls, every
+`/research` call pays for a doomed `hermes acp` subprocess spawn + full
+model load before falling through to the direct fallback anyway — expensive
+if you're on a single GPU, since loading `HERMES_INFERENCE_MODEL` can evict
+whatever else wanted that VRAM.
+
+Set `SEARCHARVESTER_ACP_ENABLED=false` to skip `hermes acp` entirely and go
+straight to the direct search+extract+`RESEARCH_FALLBACK_MODEL` fallback for
+every job. With this set, `hermes` doesn't even need to be on `PATH`. Job
+status with ACP disabled is either `completed` (fallback found sources) or
+`failed` (it didn't) — never `degraded`, since there's no ACP chat text to
+fall back to. This is a workaround, not a fix — see CLAUDE.md "Известные
+шероховатости" for the suspected root cause (GPT-OSS/Harmony adapter vs. the
+ACP wire protocol) and re-enable ACP once a reliable tool-calling
+backend/model is confirmed.
+
 ### "Forbidden" / CAPTCHA from Google
 
 SearXNG queries Google without cookies and is IP-rate-limited. If you send many queries from one IP, Google will start CAPTCHA-ing. Options:
