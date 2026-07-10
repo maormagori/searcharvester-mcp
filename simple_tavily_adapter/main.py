@@ -155,12 +155,30 @@ app.add_middleware(
 def _build_orchestrator() -> Orchestrator | None:
     """Build Orchestrator. v2.2+ runs `hermes acp` as a subprocess in the same
     container, so there's no Docker-daemon prereq. Returns None only if the
-    `hermes` binary isn't on PATH (e.g. running outside the baked image)."""
+    `hermes` binary isn't on PATH (e.g. running outside the baked image) AND
+    ACP is enabled — with SEARCHARVESTER_ACP_ENABLED=false we never spawn
+    `hermes acp`, so its presence on PATH stops being a prerequisite."""
     import shutil
+
+    acp_enabled = os.environ.get("SEARCHARVESTER_ACP_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
     hermes_bin = os.environ.get("HERMES_BIN", "hermes")
-    if shutil.which(hermes_bin) is None:
+    if acp_enabled and shutil.which(hermes_bin) is None:
         logger.warning("%s not on PATH — /research disabled", hermes_bin)
         return None
+    if not acp_enabled:
+        # See CLAUDE.md "Известные шероховатости" — the configured
+        # HERMES_INFERENCE_MODEL doesn't reliably emit real ACP tool calls,
+        # so every /research call was paying for a doomed `hermes acp`
+        # subprocess + model load before falling through to
+        # RESEARCH_FALLBACK_MODEL anyway. Disabled until that's fixed.
+        logger.warning(
+            "SEARCHARVESTER_ACP_ENABLED=false — /research skips `hermes acp` "
+            "and goes straight to the direct search+extract+%s fallback.",
+            os.environ.get("RESEARCH_FALLBACK_MODEL", "<RESEARCH_FALLBACK_MODEL unset>"),
+        )
 
     jobs_dir = FSPath(os.environ.get("JOBS_DIR", "/srv/searxng-docker/jobs"))
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +216,7 @@ def _build_orchestrator() -> Orchestrator | None:
             extract_func=_extract_markdown_for_url,
             get_http_session=lambda: _http_session,
         ),
+        acp_enabled=acp_enabled,
     )
 
 

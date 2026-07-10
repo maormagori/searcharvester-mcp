@@ -372,6 +372,7 @@ class Orchestrator:
         timeout_sec: int = 600,
         hermes_home: str | None = None,
         research_fallback: Any | None = None,
+        acp_enabled: bool = True,
     ) -> None:
         """
         hermes_bin: path to `hermes` executable (must be in $PATH of this process).
@@ -382,6 +383,13 @@ class Orchestrator:
             now, "http://localhost:8000" is the sane default.
         hermes_home: HERMES_HOME env var passed to subprocess (where skills/
             config.yaml live). Defaults to $HERMES_HOME or /opt/data.
+        acp_enabled: if False, `_run` skips spawning `hermes acp` entirely and
+            goes straight to `research_fallback` for every job. Set via
+            SEARCHARVESTER_ACP_ENABLED=false when the configured
+            HERMES_INFERENCE_MODEL can't reliably emit ACP tool calls (see
+            CLAUDE.md "Известные шероховатости") — otherwise every job pays
+            for a doomed subprocess spawn + model load before falling
+            through to the fallback anyway.
         """
         self._hermes_bin = hermes_bin
         self._skills = skills
@@ -391,6 +399,7 @@ class Orchestrator:
         self._timeout = timeout_sec
         self._hermes_home = hermes_home or os.environ.get("HERMES_HOME", "/opt/data")
         self._research_fallback = research_fallback
+        self._acp_enabled = acp_enabled
         self._jobs: dict[str, Job] = {}
         self._lock = asyncio.Lock()
 
@@ -524,8 +533,24 @@ class Orchestrator:
         await self._emit(job, Event.now(
             job_id=job_id, agent_id="lead", type="spawn",
             payload={"query": query, "skills": self._skills,
-                     "hermes_bin": self._hermes_bin},
+                     "hermes_bin": self._hermes_bin,
+                     "acp_enabled": self._acp_enabled},
         ))
+
+        if not self._acp_enabled:
+            # ACP disabled at the deployment level. `_finalize_success` with
+            # no report.md and no prior agent messages goes straight to
+            # `research_fallback`, then to `failed` if that also comes up
+            # empty — never `degraded`, since there's no ACP chat text to
+            # fall back to in the first place.
+            job.status = JobStatus.running
+            try:
+                await self._finalize_success(job)
+            finally:
+                job.finished_at = datetime.now(timezone.utc)
+                if job.started_at:
+                    job.duration_sec = (job.finished_at - job.started_at).total_seconds()
+            return
 
         # Lazy import — acp SDK lives inside the hermes venv.
         try:
